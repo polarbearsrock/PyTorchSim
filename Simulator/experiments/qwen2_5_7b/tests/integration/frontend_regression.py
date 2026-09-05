@@ -1,0 +1,169 @@
+"""Fast BF16 frontend/readback tests, run inside the simulator environment."""
+
+import os
+import shlex
+from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, os.environ["TORCHSIM_DIR"])
+
+import numpy as np
+import torch
+from torch._inductor.virtualized import V
+from torch.utils._sympy.value_ranges import ValueRanges
+
+from PyTorchSimFrontend.mlir.mlir_ops import ExtensionOverrides as Ops
+from PyTorchSimFrontend.mlir.mlir_common import MLIR_INF
+from PyTorchSimFrontend.extension_codecache import mlir_compile_command, mlir_gem5_compile_command, check_indirect_timing_supported
+from Simulator.simulator import FunctionalSimulator
+
+
+class Symbol(str):
+    def __new__(cls, name):
+        result = super().__new__(cls, name)
+        result.bounds = ValueRanges.unknown()
+        return result
+
+
+class FrontendTests(unittest.TestCase):
+    def test_indirect_timing_requires_real_index_trace(self):
+        for functional, timing, autotune in ((False, True, False), (True, True, True)):
+            with self.assertRaisesRegex(RuntimeError, "actual index trace"):
+                check_indirect_timing_supported("{indirect_access}", functional, timing, autotune)
+        for functional, timing, autotune in ((True, False, False), (True, True, False)):
+            check_indirect_timing_supported("{indirect_access}", functional, timing, autotune)
+        check_indirect_timing_supported("ordinary kernel", False, True, True)
+
+    def test_float_conversions(self):
+        for lanes in (1, 8):
+            for source, dest, opcode in (("bf16", "f32", "extf"),
+                                         ("f32", "bf16", "truncf"),
+                                         ("bf16", "f64", "extf")):
+                with self.subTest(lanes=lanes, source=source, dest=dest):
+                    with V.set_kernel_handler(SimpleNamespace(var_info={"x": [lanes, source]})):
+                        code, info = Ops.to_dtype("x", dest)
+                    self.assertIn("arith." + opcode, code)
+                    self.assertEqual(info, [lanes, dest])
+
+    def test_same_width_float_conversion_is_not_a_bitcast(self):
+        for source, dest in (("f16", "bf16"), ("bf16", "f16")):
+            kernel = SimpleNamespace(var_info={"x": [8, source], "wide": [8, "f32"]})
+            with V.set_kernel_handler(kernel), patch(
+                "PyTorchSimFrontend.mlir.mlir_ops.ops.to_dtype", return_value="wide"
+            ) as widen:
+                code, info = Ops.to_dtype("x", dest)
+            widen.assert_called_once_with("x", "f32")
+            self.assertIn("arith.truncf %wide", code)
+            self.assertEqual(info, [8, dest])
+
+    def test_bf16_arithmetic_opcodes(self):
+        x, y = Symbol("x"), Symbol("y")
+        for operation in ("add", "sub", "mul"):
+            with V.set_kernel_handler(SimpleNamespace(var_info={x: [8, "bf16"], y: [8, "bf16"]})):
+                code, info = getattr(Ops, operation)(x, y)
+            self.assertIn("arith." + operation + "f ", code)
+            self.assertEqual(info, [8, "bf16"])
+
+    def test_float_negation_preserves_type(self):
+        for dtype in ("bf16", "f16", "f32", "f64"):
+            with V.set_kernel_handler(SimpleNamespace(var_info={"x": [8, dtype]})), patch(
+                "PyTorchSimFrontend.mlir.mlir_ops.ops.to_dtype"
+            ) as cast:
+                code, info = Ops.neg("x")
+            cast.assert_not_called()
+            self.assertIn(f"arith.negf %x : vector<8x{dtype}>", code)
+            self.assertEqual(info, [8, dtype])
+
+    def test_bf16_constants(self):
+        for value, bits in (("inf", 0x7F80), ("-inf", 0xFF80), ("nan", 0x7FC0)):
+            code, info = Ops.constant(value, "bf16")
+            self.assertIn(f"0x{bits:x}", code)
+            self.assertEqual(MLIR_INF[value]["bf16"], bits)
+            self.assertEqual(info, [1, "bf16"])
+        code, _ = Ops.constant(1, "bf16")
+        self.assertIn("1.000", code)
+
+    def test_bf16_passes_are_opt_in_for_both_pipelines(self):
+        for builder, args in ((mlir_compile_command, ("kernel", 128)),
+                              (mlir_gem5_compile_command, ("kernel", "sample", "tog", 128))):
+            normal = " ".join(builder(*args))
+            bf16 = " ".join(builder(*args, uses_bf16=True))
+            self.assertNotIn("include-bf16", normal)
+            self.assertIn("include-bf16=true", bf16)
+            self.assertIn("source-types=bf16", bf16)
+            self.assertIn("-riscv-v-fixed-length-vector-lmul-max=4", bf16)
+            self.assertNotIn("-riscv-v-fixed-length-vector-lmul-max", normal)
+            self.assertLess(bf16.index("-test-memref-to-gemmini"), bf16.index("-arith-expand"))
+
+    def test_plugin_pipeline_order_and_isolation(self):
+        with patch.dict(os.environ, {"TORCHSIM_BF16_PLUGIN": "/scratch/plugin.so"}):
+            for builder, args, count in (
+                (mlir_compile_command, ("kernel", 128), 7),
+                (mlir_gem5_compile_command, ("kernel", "sample", "tog", 128), 6),
+            ):
+                commands = builder(*args, uses_bf16=True)
+                self.assertEqual(len(commands), count)
+                self.assertIn("-global-idx", commands[0])
+                self.assertNotIn("-arith-expand", commands[0])
+                self.assertIn("--pass-pipeline=builtin.module(pytorchsim-bf16", commands[1])
+                self.assertIn("--load-dialect-plugin=", commands[2])
+                self.assertIn("-arith-expand", commands[2])
+                self.assertLess(commands[2].index("-test-memref-to-gemmini"), commands[2].index("-arith-expand"))
+                self.assertIn("pytorchsim-bf16-memory,instcombine", commands[4])
+                self.assertIn(".bf16_memory.ll", commands[5])
+                first, plugin, last = map(shlex.split, commands[:3])
+                self.assertEqual(first[first.index("-o") + 1], plugin[plugin.index("-o") - 1])
+                self.assertEqual(plugin[plugin.index("-o") + 1], last[last.index("-o") - 1])
+                self.assertNotIn("plugin.so", " ".join(builder(*args)))
+
+    def test_bf16_bitwise_operators_are_rejected(self):
+        for operation in ("bitwise_and", "bitwise_or", "bitwise_xor"):
+            with V.set_kernel_handler(SimpleNamespace(var_info={"x": [8, "bf16"], "y": [8, "bf16"]})):
+                with self.assertRaises(ValueError):
+                    getattr(Ops, operation)("x", "y")
+        with V.set_kernel_handler(SimpleNamespace(var_info={"x": [8, "bf16"]})):
+            with self.assertRaises(ValueError):
+                Ops.bitwise_not("x")
+
+
+class RawIOTests(unittest.TestCase):
+    def test_all_bf16_bit_patterns_round_trip(self):
+        # Includes signed zero, finite extremes, subnormals, infinities, NaNs.
+        words = torch.arange(65536, dtype=torch.int32).to(torch.uint16)
+        values = words.view(torch.bfloat16)
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            simulator = FunctionalSimulator(directory, "test")
+            simulator.write_arg(values, directory, "input")
+            path = Path(directory) / "input/0.raw"
+            self.assertEqual(path.read_bytes(), words.numpy().tobytes())
+            actual = torch.empty_like(values)
+            simulator.load_tensor(actual, "output", None, path)
+            torch.testing.assert_close(actual.view(torch.uint16), words, rtol=0, atol=0)
+
+    def test_strided_bf16_output(self):
+        words = np.array([0x3F80, 0x4000, 0xC040, 0x4080, 0x40A0, 0x40C0], dtype=np.uint16)
+        with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+            path = Path(directory) / "output.raw"
+            path.write_bytes(words.tobytes())
+            actual = torch.empty_strided((3, 2), (1, 3), dtype=torch.bfloat16)
+            FunctionalSimulator(directory, "test").load_tensor(actual, "output", None, path)
+            expected = torch.from_numpy(words).view(torch.bfloat16).reshape(2, 3).t()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_other_float_readback_unchanged(self):
+        for torch_dtype, np_dtype in ((torch.float16, np.float16), (torch.float32, np.float32)):
+            with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+                path = Path(directory) / "output.raw"
+                values = np.array([0, 1, -2, 3.5], dtype=np_dtype)
+                path.write_bytes(values.tobytes())
+                actual = torch.empty(4, dtype=torch_dtype)
+                FunctionalSimulator(directory, "test").load_tensor(actual, "output", None, path)
+                torch.testing.assert_close(actual, torch.from_numpy(values), rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    unittest.main()

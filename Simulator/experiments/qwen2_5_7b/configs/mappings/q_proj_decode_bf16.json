@@ -1,0 +1,10 @@
+{
+  "1_3584_3584": {
+    "TILE_M": 8,
+    "TILE_N": 896,
+    "TILE_K": 3584,
+    "SUB_TILE_M": 8,
+    "SUB_TILE_N": 896,
+    "SUB_TILE_K": 3584
+  }
+}

@@ -4,6 +4,7 @@
 #include <map>
 #include <queue>
 #include <set>
+#include <stdexcept>
 #include "Tile.h"
 #include "IntervalTree.h"
 
@@ -12,7 +13,17 @@ class TileSubGraph {
   TileSubGraph();
   void add_tile(std::shared_ptr<Tile> tile);
   void finish_tile(std::shared_ptr<Tile> tile);
-  bool is_finished() { return _ready_tile_queue.empty() && _tile_set.empty(); }
+  // Dispatch is not completion. Async DMA can also outlive tile retirement.
+  bool is_finished() {
+    return _ready_tile_queue.empty() && _tile_set.empty() &&
+           _inflight_tiles == 0 && _pending_dma == 0;
+  }
+  void start_dma() { ++_pending_dma; }
+  void finish_dma() {
+    if (_pending_dma == 0)
+      throw std::logic_error("DMA completion without an outstanding transfer");
+    --_pending_dma;
+  }
   const std::shared_ptr<Tile> peek_tile();
   std::shared_ptr<Tile> get_tile();
   int get_id() { return _id; }
@@ -29,6 +40,8 @@ class TileSubGraph {
  protected:
   std::priority_queue<std::shared_ptr<Tile>, std::vector<std::shared_ptr<Tile>>, CompareReadyTile> _ready_tile_queue;
   std::set<std::shared_ptr<Tile>> _tile_set;
+  size_t _inflight_tiles = 0;
+  size_t _pending_dma = 0;
   int _id;
   int _core_id = -1;
   static int _next_id;

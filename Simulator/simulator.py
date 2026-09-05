@@ -67,7 +67,8 @@ TORCH_TO_NUMPY = {
     torch.int8: np.int8,
     torch.uint8: np.uint8,
     torch.bool: np.uint8,
-    torch.bfloat16: np.float16,
+    # NumPy has no native BF16: transport raw bits, never interpret as IEEE FP16.
+    torch.bfloat16: np.uint16,
     torch.float16: np.float16,
 }
 
@@ -80,7 +81,10 @@ class FunctionalSimulator():
         # path = os.path.join(dump_path, arg_name, f'{n_call}.raw')
         with open(path, 'rb') as f:
             np_array = np.fromfile(f, dtype=TORCH_TO_NUMPY[arg.dtype])
-            src_tensor = torch.as_strided(torch.from_numpy(np_array), arg.size(), arg.stride())
+            src_tensor = torch.from_numpy(np_array)
+            if arg.dtype == torch.bfloat16:
+                src_tensor = src_tensor.view(torch.bfloat16)
+            src_tensor = torch.as_strided(src_tensor, arg.size(), arg.stride())
             arg.copy_(src_tensor.to(dtype=arg.dtype))
 
     def get_biggest_filename(self, path):
@@ -144,7 +148,8 @@ class FunctionalSimulator():
         base_path= f"--base-path={runtime_path}"
         os.makedirs(os.path.join(runtime_path, "indirect_access"), exist_ok=True)
         os.makedirs(os.path.join(runtime_path, "dma_access"), exist_ok=True)
-        run = f'spike --isa rv64gcv_zfh --varch=vlen:256,elen:64 {vectorlane_option} {spad_option} {kernel_address} {base_path} /workspace/riscv-pk/build/pk {target_binary} {file_path_str}'
+        spike = shlex.quote(os.environ.get("TORCHSIM_SPIKE", "spike"))
+        run = f'{spike} --isa rv64gcv_zfh --varch=vlen:256,elen:64 {vectorlane_option} {spad_option} {kernel_address} {base_path} /workspace/riscv-pk/build/pk {target_binary} {file_path_str}'
         if not silent_mode:
             logger.debug(f"[Spike] cmd> {run}")
             logger.info("[Spike] Running Spike simulator")

@@ -37,15 +37,101 @@ def dump_metadata(args, arg_attributes, path):
             file.write(f'{arg_name}=({arg_attribute[0]}, {arg.dtype}, {arg.shape})\n')
     return
 
-def mlir_compile_command(filename, vectorlane_size, vlen=256):
-    return [re.sub(r"[ \n]+", " ",
+def bf16_legalization_passes(enabled):
+    # Keep BF16 storage, but perform unsupported arithmetic in FP32.
+    return "-arith-emulate-unsupported-floats='source-types=bf16 target-type=f32'" if enabled else ""
+
+
+def bf16_expansion_pass(enabled):
+    # Expand BF16 casts only AFTER indirect DMA lowering (and TOG extraction).
+    # arith-expand also folds affine.apply. Our indirect-addressing marker uses
+    # an otherwise-unused affine symbol; folding it early silently drops the
+    # lookup indices. The DMA pass must consume that marker first.
+    return "-arith-expand='include-bf16=true'" if enabled else ""
+
+
+def bf16_matrix_pass(enabled, vectorlane_size, vlen):
+    plugin = os.environ.get("TORCHSIM_BF16_PLUGIN")
+    if not enabled or not plugin:
+        return ""
+    return (f"--load-pass-plugin={shlex.quote(plugin)} "
+            f"-pytorchsim-bf16-to-vcix='systolic-array-size={vectorlane_size} vlen={vlen}'")
+
+
+def bf16_llc_options(enabled):
+    # The bundled gem5 decoder rejects integer-extension instructions at LMUL=8.
+    # Apply the same conservative register-group cap to functional and timing
+    # compilation; do not silently benchmark a different instruction stream.
+    return "-riscv-v-fixed-length-vector-lmul-max=4" if enabled else ""
+
+
+def split_bf16_plugin_stage(commands):
+    """Plugin passes are registered too late for MLIR's individual CLI flags.
+
+    Run the plugin with a textual pipeline between the existing preparation
+    and lowering stages. Keep each process separate so failures propagate.
+    """
+    tokens = shlex.split(commands[0])
+    positions = [i for i, token in enumerate(tokens) if token.startswith("--load-pass-plugin=")]
+    if not positions:
+        return commands
+    index = positions[0]
+    output_index = tokens.index("-o")
+    source, output = tokens[output_index - 1], tokens[output_index + 1]
+    before, after = output + ".bf16_pre.mlir", output + ".bf16_post.mlir"
+    name, options = tokens[index + 1].lstrip("-").split("=", 1)
+    # Expanding casts inside a named linalg.matmul region would violate that
+    # operation's verifier. Lower matmul first, then legalize the remaining
+    # BF16 vector arithmetic and casts.
+    legalization = [token for token in tokens[:index] if token.startswith("-arith-")]
+    # This fork's custom DMA assembly printer/parser cannot round-trip every
+    # attribute combination. Generic operation syntax preserves them exactly.
+    preparation = [token for token in tokens[:index] if token not in legalization] + ["--mlir-print-op-generic", source, "-o", before]
+    plugin = [tokens[0], tokens[index],
+              f"--pass-pipeline=builtin.module({name}{{{options}}})",
+              "--mlir-print-op-generic", before, "-o", after]
+    dialect_plugin = tokens[index].replace("--load-pass-plugin=", "--load-dialect-plugin=", 1)
+    lowering = [tokens[0], dialect_plugin] + legalization + tokens[index + 2:]
+    lowering[lowering.index("-o") - 1] = after
+    return [shlex.join(stage) for stage in (preparation, plugin, lowering)] + commands[1:]
+
+
+def add_bf16_memory_stage(commands, enabled):
+    plugin = os.environ.get("TORCHSIM_BF16_PLUGIN")
+    if not enabled or not plugin:
+        return commands
+    memory_plugin = os.path.join(os.path.dirname(plugin), "libPyTorchSimBF16Memory.so")
+    result = []
+    translated = legalized = None
+    for command in commands:
+        arguments = shlex.split(command)
+        if translated:
+            arguments = [legalized if argument == translated else argument for argument in arguments]
+        result.append(shlex.join(arguments))
+        if os.path.basename(arguments[0]) == "mlir-translate":
+            translated = arguments[arguments.index("-o") + 1]
+            legalized = translated + ".bf16_memory.ll"
+            result.append(shlex.join([
+                os.path.join(extension_config.CONFIG_TORCHSIM_LLVM_PATH, "opt"),
+                f"--load-pass-plugin={memory_plugin}",
+                "-passes=pytorchsim-bf16-memory,instcombine", "-S",
+                translated, "-o", legalized,
+            ]))
+    return result
+
+
+def mlir_compile_command(filename, vectorlane_size, vlen=256, uses_bf16=False):
+    commands = [re.sub(r"[ \n]+", " ",
         f"""
             {extension_config.CONFIG_TORCHSIM_LLVM_PATH}/mlir-opt \
             -test-loop-padding \
             -dma-fine-grained='systolic-array-size={vectorlane_size}' \
             -global-idx='vlen={vlen}' \
+            {bf16_legalization_passes(uses_bf16)} \
+            {bf16_matrix_pass(uses_bf16, vectorlane_size, vlen)} \
             -test-pytorchsim-to-vcix='systolic-array-size={vectorlane_size} vlen={vlen}' \
             -test-memref-to-gemmini="vectorlane={vectorlane_size}" \
+            {bf16_expansion_pass(uses_bf16)} \
             -convert-linalg-to-loops \
             -convert-vector-to-scf='full-unroll' \
             -lower-affine \
@@ -71,6 +157,7 @@ def mlir_compile_command(filename, vectorlane_size, vlen=256):
             re.sub(r"[ \n]+", " ",
         f"""
             {extension_config.CONFIG_TORCHSIM_LLVM_PATH}/llc \
+                {bf16_llc_options(uses_bf16)} \
                 -relocation-model=pic -march=riscv64 -O3 --stack-size-section \
                 -mattr=+m,+f,+d,+a,+c,+v,+zvfh,+xsfvcp,zvl{vlen}b \
                 -filetype=obj \
@@ -81,22 +168,27 @@ def mlir_compile_command(filename, vectorlane_size, vlen=256):
             re.sub(r"[ \n]+", " ",
         f"""
             {extension_config.CONFIG_TORCHSIM_LLVM_PATH}/llc \
+                {bf16_llc_options(uses_bf16)} \
                 -relocation-model=pic -march=riscv64 -O3 --stack-size-section \
                 -mattr=+m,+f,+d,+a,+c,+v,+zvfh,+xsfvcp,zvl{vlen}b \
                 -O2 {filename}.ll -o {filename}.s
         """,
     ).strip()]
+    return add_bf16_memory_stage(split_bf16_plugin_stage(commands), uses_bf16)
 
-def mlir_gem5_compile_command(filename, sample_filename, tog_file, vectorlane_size, vlen=256):
-    return [re.sub(r"[ \n]+", " ",
+def mlir_gem5_compile_command(filename, sample_filename, tog_file, vectorlane_size, vlen=256, uses_bf16=False):
+    commands = [re.sub(r"[ \n]+", " ",
         f"""
             {extension_config.CONFIG_TORCHSIM_LLVM_PATH}/mlir-opt \
             -test-loop-padding='timing_mode=1' \
             -dma-fine-grained='systolic-array-size={vectorlane_size}' \
             -global-idx='vlen={vlen}' \
+            {bf16_legalization_passes(uses_bf16)} \
+            {bf16_matrix_pass(uses_bf16, vectorlane_size, vlen)} \
             -test-pytorchsim-to-vcix='systolic-array-size={vectorlane_size} vlen={vlen}' \
             -test-tile-operation-graph='vectorlane={vectorlane_size} sample-mode={extension_config.CONFIG_TLS_MODE}' \
             -test-memref-to-gemmini="vectorlane={vectorlane_size} timing=1" \
+            {bf16_expansion_pass(uses_bf16)} \
             -convert-linalg-to-loops \
             -convert-vector-to-scf='full-unroll' \
             -lower-affine \
@@ -122,6 +214,7 @@ def mlir_gem5_compile_command(filename, sample_filename, tog_file, vectorlane_si
             re.sub(r"[ \n]+", " ",
         f"""
             {extension_config.CONFIG_TORCHSIM_LLVM_PATH}/llc \
+                {bf16_llc_options(uses_bf16)} \
                 -relocation-model=pic -march=riscv64 -O3 --stack-size-section \
                 -mattr=+m,+f,+d,+a,+c,+v,+zvfh,+xsfvcp,zvl{vlen}b \
                 -filetype=obj \
@@ -129,6 +222,7 @@ def mlir_gem5_compile_command(filename, sample_filename, tog_file, vectorlane_si
                 -O2 {sample_filename}.ll -o {sample_filename}.o
         """,
     ).strip()]
+    return add_bf16_memory_stage(split_bf16_plugin_stage(commands), uses_bf16)
 
 class SpadOverflowError(Exception):
     def __init__(self, message="SPAD overflow occurred."):
@@ -163,7 +257,17 @@ class MLIRCodeCache:
         tog_path = os.path.join(write_path, "tile_graph.onnx")
         sample_mlir_path = new_input_path + "_sample"
         validation_binary_path = os.path.join(write_path, validation_binary_name)
-        gem5_cmds = mlir_gem5_compile_command(new_input_path, sample_mlir_path, raw_tog_path, vectorlane_size)
+        # Shaped types spell this as "...xbf16", so a leading word boundary
+        # would miss kernels that have no scalar BF16 constants.
+        uses_bf16 = "bf16" in source_code
+        if re.search(r"linalg\.matmul\s+ins\([^)]*bf16", source_code):
+            if not os.environ.get("TORCHSIM_BF16_PLUGIN"):
+                raise RuntimeError(
+                    "BF16 matrix operations require TORCHSIM_BF16_PLUGIN and the "
+                    "patched Spike for functional execution. See "
+                    "Simulator/experiments/qwen2_5_7b/docs/toolchain.md."
+                )
+        gem5_cmds = mlir_gem5_compile_command(new_input_path, sample_mlir_path, raw_tog_path, vectorlane_size, vlen=vlen, uses_bf16=uses_bf16)
 
         from filelock import FileLock
         os.makedirs(write_path, exist_ok=True)
@@ -177,17 +281,11 @@ class MLIRCodeCache:
         if extension_config.pytorchsim_functional_mode:
             # Use custom malloc to avoid size error
             new_link_option = link_option + " -Wl,--wrap=malloc -Wl,--wrap=free"
-            cmds = mlir_compile_command(new_input_path, vectorlane_size, vlen=vlen)
-            opt_cmd = shlex.split(cmds[0])
-            translate_cmd = shlex.split(cmds[1])
-            llc_cmd = shlex.split(cmds[2])
-            llc_asm_cmd = shlex.split(cmds[3])
+            cmds = mlir_compile_command(new_input_path, vectorlane_size, vlen=vlen, uses_bf16=uses_bf16)
             with lock:
                 try:
-                    subprocess.check_call(opt_cmd)
-                    subprocess.check_call(translate_cmd)
-                    subprocess.check_call(llc_cmd)
-                    subprocess.check_call(llc_asm_cmd)
+                    for command in cmds:
+                        subprocess.check_call(shlex.split(command))
                 except subprocess.CalledProcessError as e:
                     logger.error(f"Command failed with exit code {e.returncode}")
                     logger.error(f"Error output: {e.output.decode() if isinstance(e.output, bytes) else e.output}")
@@ -213,18 +311,17 @@ class MLIRCodeCache:
             return key
 
         # Launch tile graph generator
-        gem5_sample_cmd = shlex.split(gem5_cmds[0])
-        gem5_translate_cmd = shlex.split(gem5_cmds[1])
-        gem5_llc_cmd = shlex.split(gem5_cmds[2])
-
         lock = FileLock(get_lock_path(write_path), timeout=LOCK_TIMEOUT)
         with lock:
             try:
-                result = subprocess.check_output(gem5_sample_cmd)
-                with open(raw_tog_path, "wb") as file:
-                    file.write(result)
-                subprocess.check_call(gem5_translate_cmd)
-                subprocess.check_call(gem5_llc_cmd)
+                for command in gem5_cmds:
+                    arguments = shlex.split(command)
+                    if any(arg.startswith("-test-tile-operation-graph=") for arg in arguments):
+                        result = subprocess.check_output(arguments)
+                        with open(raw_tog_path, "wb") as file:
+                            file.write(result)
+                    else:
+                        subprocess.check_call(arguments)
             except subprocess.CalledProcessError as e:
                 logger.error(f"Command failed with exit code {e.returncode}")
                 logger.error(f"Error output: {e.output.decode() if isinstance(e.output, bytes) else e.output}")
@@ -260,6 +357,18 @@ class MLIRCodeCache:
             )
         return key
 
+def check_indirect_timing_supported(source_code, functional, timing, autotune):
+    # TOGSim reads per-invocation index files emitted by Spike. Without them it
+    # only warns and falls back to direct addresses, yielding misleading timing.
+    if "indirect_access" in source_code and timing and (not functional or autotune):
+        raise RuntimeError(
+            "Indirect-address timing requires a functional Spike run to produce "
+            "the actual index trace; timing-only/autotune execution is unsafe. "
+            "Enable functional + timing modes and use heuristic mapping. The "
+            "Qwen attention probe provides --validate-timing for this workflow."
+        )
+
+
 class CustomAsyncCompile(AsyncCompile):
     def __init__(self):
         self.validation_wrapper_name = "validation_wrapper"
@@ -269,6 +378,8 @@ class CustomAsyncCompile(AsyncCompile):
 
     def mlir(self, source_code, arg_attributes=[], vectorlane_size=16, tile_size=[], spad_info=None, origins=None, silent_mode=False, **kwargs):
         autotune = kwargs.get('autotune', False)
+        check_indirect_timing_supported(source_code, extension_config.pytorchsim_functional_mode,
+                                        extension_config.pytorchsim_timing_mode, autotune)
         def task():
             key = MLIRCodeCache.load(source_code,
                                           valdiation_wrapper_name=self.validation_binary_name,

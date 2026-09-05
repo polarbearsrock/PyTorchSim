@@ -1,0 +1,764 @@
+//===- BF16ToVCIXConversion.cpp - Test conversion to gemmini ops ---------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "mlir/Conversion/ConvertToLLVM/ToLLVMInterface.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/VCIXDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Types.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Analysis/CustomDMAAttribute.h"
+#include "mlir/Tools/Plugins/PassPlugin.h"
+#include "mlir/Tools/Plugins/DialectPlugin.h"
+// Derived from PSAL-POSTECH/llvm-project 970a927190e8402348cadf9585bf134c8a8c09c2.
+// Only BF16-input / FP32-accumulator matmul is handled by this plugin.
+
+namespace mlir {
+namespace {
+
+int SYSTOLIC_SIZE = 128;
+int VLEN = 128;
+
+int64_t getLoopUpperBound(mlir::affine::AffineForOp forOp) {
+  if (auto constantOp = forOp.getUpperBoundMap().getSingleConstantResult()) {
+    return constantOp;
+  }
+  return -1;  // This is an example, handle dynamic cases as needed
+}
+
+std::pair<Value, bool> getDramMemRef(mlir::memref::DmaStartOp dmaOp) {
+  auto dst_space = dmaOp.getDstMemorySpace();
+  auto src_space = dmaOp.getSrcMemorySpace();
+  Value dram_memref;
+  bool is_write;
+
+  if (dst_space == 0 && src_space == 1) {
+    dram_memref = dmaOp.getDstMemRef();
+    is_write = true;
+  } else if (dst_space == 1 && src_space == 0) {
+    dram_memref = dmaOp.getSrcMemRef();
+    is_write = false;
+  } else {
+    dmaOp.emitError() << "Unexpected memory space, src: " << src_space << ", dst: " << dst_space << "\n";
+  }
+  return std::make_pair(dram_memref, is_write);
+}
+
+std::pair<Value, bool> getSramMemRef(mlir::memref::DmaStartOp dmaOp) {
+  auto dst_space = dmaOp.getDstMemorySpace();
+  auto src_space = dmaOp.getSrcMemorySpace();
+  Value sram_memref;
+  bool is_write;
+
+  if (dst_space == 0 && src_space == 1) {
+    sram_memref = dmaOp.getSrcMemRef();
+    is_write = true;
+  } else if (dst_space == 1 && src_space == 0) {
+    sram_memref = dmaOp.getDstMemRef();
+    is_write = false;
+  } else {
+    dmaOp.emitError() << "Unexpected memory space, src: " << src_space << ", dst: " << dst_space << "\n";
+  }
+  return std::make_pair(sram_memref, is_write);
+}
+
+bool traverseMMOperands(Value value, Value input) {
+  if (value == input)
+    return true;
+  if (auto *op = value.getDefiningOp())
+    for (Value operand : op->getOperands())
+      if (traverseMMOperands(operand, input))
+        return true;
+  return false;
+}
+
+struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(linalg::MatmulOp op, PatternRewriter &rewriter) const override {
+    // Get the operands
+    Value A = op.getInputs()[0];
+    Value B = op.getInputs()[1];
+    Value C = op.getOutputs()[0];
+
+    Location loc = op.getLoc();
+
+    int vlen = VLEN; //FIXME
+    int elen = 0;
+    int nr_element;
+
+    // Get input matrix's shape and type
+    mlir::MemRefType memRefTypeA, memRefTypeB, memRefTypeC;
+    mlir::Type elementTypeA, elementTypeB, elementTypeC;
+
+    memRefTypeA = mlir::dyn_cast<mlir::MemRefType>(A.getType());
+    memRefTypeB = mlir::dyn_cast<mlir::MemRefType>(B.getType());
+    memRefTypeC = mlir::dyn_cast<mlir::MemRefType>(C.getType());
+    if (!memRefTypeA || !memRefTypeB || !memRefTypeC) {
+      op.emitError () << "expected MemRefType inputs";
+      return failure(true);
+    }
+    elementTypeA = memRefTypeA.getElementType();
+    elementTypeB = memRefTypeB.getElementType();
+    elementTypeC = memRefTypeC.getElementType();
+    if (!elementTypeA.isBF16() || !elementTypeB.isBF16() || !elementTypeC.isF32()) {
+      return rewriter.notifyMatchFailure(op, "requires BF16 inputs and FP32 accumulator");
+    }
+    if (elementTypeA != elementTypeB) {
+      op.emitError () << "expected same input type";
+      return failure(true);
+    }
+
+    // Get the dimensions of the input matrices
+    int M = memRefTypeA.getShape()[0];
+    int K = memRefTypeA.getShape()[1];
+    int N = memRefTypeB.getShape()[1];
+
+    // Ensure the dimensions are multiples of SYSTOLIC_SIZE
+    if ((M > SYSTOLIC_SIZE && (M % SYSTOLIC_SIZE != 0))) {
+      op.emitError() << "M must be multiples of SYSTOLIC_SIZE";
+      return failure();
+    }
+    if ((N > SYSTOLIC_SIZE && (N % SYSTOLIC_SIZE != 0))) {
+      op.emitError() << "N must be multiples of SYSTOLIC_SIZE";
+      return failure();
+    }
+    if ((K > SYSTOLIC_SIZE && (K % SYSTOLIC_SIZE != 0))) {
+      op.emitError() << "K must be multiples of SYSTOLIC_SIZE";
+      return failure();
+    }
+
+    if (memRefTypeB.getShape()[0] != K) {
+      op.emitError() << "K dimension mismatch: A(" << K << ") != B(" << memRefTypeB.getShape()[0] << ")";
+      return failure();
+    }
+
+
+    // Get element size
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementTypeA)) {
+      elen = intType.getWidth();
+    } else if (auto floatType = mlir::dyn_cast<mlir::FloatType>(elementTypeA)) {
+      elen = floatType.getWidth();
+    } else {
+      return failure();
+    }
+
+    nr_element = vlen / elen;
+
+    // Opcode attribute
+    Attribute zeroImmAttr = rewriter.getI64IntegerAttr(0);
+    Attribute bf16ImmAttr = rewriter.getI64IntegerAttr(1);
+    Attribute vipush_opcode =  rewriter.getI64IntegerAttr(0b000000);
+    Attribute vwpush_opcode =  rewriter.getI64IntegerAttr(0b000001);
+    Attribute compute_opcode = rewriter.getI64IntegerAttr(0b000001);
+    Attribute vpop_opcode = rewriter.getI64IntegerAttr(0b000010);
+    Attribute sew = rewriter.getI64IntegerAttr(elen);
+    Attribute lmul = rewriter.getI64IntegerAttr(0); // 0: m1, 1: m2, 2: m4, 3: m8, 5: mf8, 6: mf4, 7: mf2
+    auto vectorType = VectorType::get({nr_element}, elementTypeA);
+    int nr_m_element = std::max(std::min(M, nr_element), 2); // required 2 elements for vector load/store
+    auto vectorMType = VectorType::get({nr_m_element}, elementTypeA);
+    const int nr_output_element = vlen / 32;
+    auto vectorOutputType = VectorType::get({std::max(std::min(M, nr_output_element), 2)}, elementTypeC);
+    Value n_idx;
+    Value k_idx;
+    Value m_idx;
+
+    auto spadIdxMap = AffineMap::get(
+      /*dimCount=*/3, /*symbolCount=*/2,
+      rewriter.getAffineDimExpr(0) * rewriter.getAffineSymbolExpr(0) +
+      rewriter.getAffineDimExpr(1) * rewriter.getAffineSymbolExpr(1) +
+      rewriter.getAffineDimExpr(2), // This represents `n_idx * K + k_idx * SYSTOLIC_SIZE + i`
+      rewriter.getContext()
+    );
+    auto spadXIdxMap = AffineMap::get(
+      /*dimCount=*/1, /*symbolCount=*/1,
+      rewriter.getAffineDimExpr(0).floorDiv(rewriter.getAffineSymbolExpr(0)),
+      rewriter.getContext()
+    );
+    auto spadYIdxMap = AffineMap::get(
+      /*dimCount=*/1, /*symbolCount=*/1,
+      rewriter.getAffineDimExpr(0) % rewriter.getAffineSymbolExpr(0),
+      rewriter.getContext()
+    );
+    auto spadIdxMapAttr = mlir::AffineMapAttr::get(spadIdxMap);
+    auto spadXIdxMapAttr = mlir::AffineMapAttr::get(spadXIdxMap);
+    auto spadYIdxMapAttr = mlir::AffineMapAttr::get(spadYIdxMap);
+
+    // Put dma wait operation
+    mlir::Value ADmaTag;
+    mlir::Value BDmaTag;
+    mlir::Value BiasDmaTag;
+    int ADmaAsync = 0;
+    int BDmaAsync = 0;
+    int BiasDmaAsync = 0;
+    ValueRange BiasDMAIndices;
+    std::vector<affine::AffineForOp> accumulationLoops;
+    std::vector<affine::AffineForOp> outerLoops;
+    std::vector<affine::AffineForOp> innerLoops;
+
+    bool isAInitialized = false;
+    bool isBInitialized = false;
+
+    // Find accumulation loops and set last outerloop
+    auto affineForOp = llvm::dyn_cast_or_null<affine::AffineForOp>(op->getParentRegion()->getParentOp());
+    while (affineForOp) {
+      if (auto attr = affineForOp->getAttrOfType<BoolAttr>("accumulation_loop")) {
+        accumulationLoops.insert(accumulationLoops.begin(), affineForOp);
+      }
+      if (auto attr = affineForOp->getAttrOfType<BoolAttr>("outer_loop")) {
+        outerLoops.insert(outerLoops.begin(), affineForOp);
+      }
+      if (auto attr = affineForOp->getAttrOfType<BoolAttr>("inner_loop")) {
+        innerLoops.insert(innerLoops.begin(), affineForOp);
+      }
+      affineForOp = llvm::dyn_cast_or_null<affine::AffineForOp>(affineForOp->getParentOp());
+    }
+
+    bool is_conv2d = (innerLoops.size() == 4);
+    if (accumulationLoops.empty()) {
+      op.emitError()
+          << "Expected at least one loop with 'accumulation_loop' attribute";
+      return failure();
+    }
+    if (outerLoops.size() < 2) {
+      op.emitError()
+          << "Expected at least two loops with 'outer_loop' attribute";
+      return failure();
+    }
+
+    affine::AffineForOp tile_k_w_loop, tile_o_h_loop, tile_o_w_loop;
+
+    if (is_conv2d) {
+      tile_k_w_loop = innerLoops.at(1);
+      tile_o_h_loop = innerLoops.at(2);
+      tile_o_w_loop = innerLoops.at(3);
+      rewriter.setInsertionPoint(&tile_k_w_loop.getBody()->back()); // to reuse CONV kernel
+    }
+
+    // Constants
+    Value c0 = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+    Value rvl = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(nr_element));
+    Attribute compute_cycle = rewriter.getI64IntegerAttr(4); // FIXME: 5 bits bound & hardcoded
+    Value M_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), M);
+    Value K_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), K);
+    Value N_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), N);
+    Value SYSTOLIC_SIZE_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), SYSTOLIC_SIZE);
+    mlir::Value numElements = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
+
+    // Set Last outer loop
+    affineForOp = outerLoops.back();
+    int subtileM = M;
+    int subtileN = N;
+    int subtileK = K;
+    bool hasASubtileM = false;
+    bool hasASubtileK = false;
+    bool hasBSubtileN = false;
+    bool hasBSubtileK = false;
+    int aSubtileM = 0;
+    int aSubtileK = 0;
+    int bSubtileN = 0;
+    int bSubtileK = 0;
+    bool subtileError = false;
+
+    llvm::SmallVector<int32_t, 3> idxMap = {0, 1, 2};
+
+    if (auto idxMapAttr = op->getAttrOfType<mlir::DenseI32ArrayAttr>("idx_map"))
+        idxMap.assign(idxMapAttr.asArrayRef().begin(), idxMapAttr.asArrayRef().end());
+
+    auto parseSubtilePair = [&](ArrayRef<mlir::Attribute> dmaSubtile,
+                                StringRef operandName,
+                                StringRef expectedOrder,
+                                int &firstDim,
+                                int &secondDim) -> LogicalResult {
+      if (dmaSubtile.size() < 2) {
+        op.emitError() << "Invalid 'subtile_size' for " << operandName
+                       << ": expected at least 2 values " << expectedOrder;
+        return failure();
+      }
+      auto firstAttr =
+          llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 2]);
+      auto secondAttr =
+          llvm::dyn_cast<mlir::IntegerAttr>(dmaSubtile[dmaSubtile.size() - 1]);
+      if (!firstAttr || !secondAttr) {
+        op.emitError() << "Invalid 'subtile_size' for " << operandName
+                       << ": expected integer values";
+        return failure();
+      }
+      firstDim = firstAttr.getInt();
+      secondDim = secondAttr.getInt();
+      if (firstDim <= 0 || secondDim <= 0) {
+        op.emitError() << "Invalid 'subtile_size' for " << operandName
+                       << ": values must be > 0";
+        return failure();
+      }
+      return success();
+    };
+
+    auto walkResult = affineForOp->walk([&](mlir::Operation *nestedOp) {
+      if (auto dmaStartOp = llvm::dyn_cast<memref::DmaStartOp>(nestedOp)) { // Replace DMAStartOp with actual `dma_start` op type
+        auto result = getDramMemRef(dmaStartOp);
+        auto sramRef = getSramMemRef(dmaStartOp);
+        bool sramUsedInMatmul = false;
+
+        for (auto operand : op->getOperands()) {
+          if (traverseMMOperands(operand, sramRef.first)) { // for CONV2D reshape op, we need to traverse operands
+            sramUsedInMatmul = true;
+            break;
+          }
+        }
+        /* Only DMA load */
+        if (result.second) {
+          return WalkResult::advance();
+        }
+
+        /* Only wait operand dma */
+        if (!sramUsedInMatmul) {
+          return WalkResult::advance();
+        }
+        auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(result.first);
+        if (!blockArg) {
+          return WalkResult::advance();
+        }
+        if (blockArg.getArgNumber() == idxMap[0]) {
+          ADmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+          ADmaAsync = getAsyncValue(dmaStartOp);
+          llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(dmaStartOp);
+          if (!dmaSubtile.empty()) {
+            int parsedM = 0;
+            int parsedK = 0;
+            if (failed(parseSubtilePair(dmaSubtile, "A", "[M, K]", parsedM,
+                                        parsedK))) {
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            if ((hasASubtileM && aSubtileM != parsedM) ||
+                (hasASubtileK && aSubtileK != parsedK)) {
+              op.emitError() << "Inconsistent A 'subtile_size' across DMA ops";
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            hasASubtileM = true;
+            hasASubtileK = true;
+            aSubtileM = parsedM;
+            aSubtileK = parsedK;
+            subtileM = parsedM;
+          }
+
+          isAInitialized = true;
+        } else if (blockArg.getArgNumber() == idxMap[1]) {
+          BDmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+          BDmaAsync = getAsyncValue(dmaStartOp);
+          llvm::SmallVector<mlir::Attribute> dmaSubtile = getSubtileSize(dmaStartOp);
+          if (!dmaSubtile.empty()) {
+            int parsedK = 0;
+            int parsedN = 0;
+            if (failed(parseSubtilePair(dmaSubtile, "B", "[K, N]", parsedK,
+                                        parsedN))) {
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            if ((hasBSubtileK && bSubtileK != parsedK) ||
+                (hasBSubtileN && bSubtileN != parsedN)) {
+              op.emitError() << "Inconsistent B 'subtile_size' across DMA ops";
+              subtileError = true;
+              return WalkResult::interrupt();
+            }
+            hasBSubtileK = true;
+            hasBSubtileN = true;
+            bSubtileK = parsedK;
+            bSubtileN = parsedN;
+            subtileN = parsedN;
+          }
+
+          isBInitialized = true;
+        } else if (blockArg.getArgNumber() == idxMap[2]) {
+          BiasDmaTag = dmaStartOp.getTagMemRef(); // Assuming `getTag()` retrieves the `tag` from `dma_start`.
+          BiasDmaAsync = getAsyncValue(dmaStartOp);
+          BiasDMAIndices = dmaStartOp.getTagIndices();
+        }
+      }
+      else if (auto vectorStoreOp = llvm::dyn_cast<affine::AffineVectorStoreOp>(nestedOp)) {
+        auto getOrigin = [](Value v) -> Value {
+            if (Operation *defOp = v.getDefiningOp()) {
+                if (auto reinterpret = llvm::dyn_cast<memref::ReinterpretCastOp>(defOp))
+                    return reinterpret.getSource();
+                if (auto memcast = llvm::dyn_cast<memref::CastOp>(defOp))
+                    return memcast.getSource();
+            }
+            return v;
+        };
+
+        Value sramRef = vectorStoreOp.getMemRef();
+        Value rootSramRef = getOrigin(sramRef);
+        Value rootA = getOrigin(A);
+        Value rootB = getOrigin(B);
+
+        if (rootSramRef == rootA)
+            isAInitialized = true;
+        else if (rootSramRef == rootB)
+            isBInitialized = true;
+      }
+
+      return WalkResult::advance();
+    });
+    if (walkResult.wasInterrupted() || subtileError)
+      return failure();
+
+    if (hasASubtileK && hasBSubtileK) {
+      if (aSubtileK != bSubtileK) {
+        op.emitError() << "Mismatched subtile K between A and B: A(" << aSubtileK
+                       << ") != B(" << bSubtileK << ")";
+        return failure();
+      }
+      subtileK = aSubtileK;
+    } else if (hasASubtileK) {
+      subtileK = aSubtileK;
+      if (subtileK != K) {
+        op.emitError() << "B has no 'subtile_size', expected K fallback(" << K
+                       << ") to match A subtileK(" << subtileK << ")";
+        return failure();
+      }
+    } else if (hasBSubtileK) {
+      subtileK = bSubtileK;
+      if (subtileK != K) {
+        op.emitError() << "A has no 'subtile_size', expected K fallback(" << K
+                       << ") to match B subtileK(" << subtileK << ")";
+        return failure();
+      }
+    }
+    if (hasASubtileM)
+      subtileM = aSubtileM;
+    if (hasBSubtileN)
+      subtileN = bSubtileN;
+
+    int KStep = subtileK;
+    int push_length = subtileM > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : subtileM;
+    int MStep = M > push_length ? push_length : M;
+    int NStep = subtileN > SYSTOLIC_SIZE ? SYSTOLIC_SIZE : subtileN;
+    Value vector_elements = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), push_length);
+
+    if (!isAInitialized || !isBInitialized) {
+        op.emitError () << "Failed to locate data source for operands. Neither dma_start nor preceding vector_store found for A or B.";
+        return failure();
+    }
+
+    // Create inner loops for micro tile(SRAM <-> VRF).
+    affine::AffineForOp inner_loop;
+    Value zero_vector;
+    if (N > SYSTOLIC_SIZE) {
+      // N Loop
+      inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, N/SYSTOLIC_SIZE, 1);
+      inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
+      rewriter.setInsertionPointToStart(inner_loop.getBody());
+      n_idx = inner_loop.getInductionVar();
+    } else {
+      n_idx = c0;
+    }
+
+    if (K > SYSTOLIC_SIZE) {
+      // K Loop
+      inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, K/SYSTOLIC_SIZE, 1);
+      inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
+      rewriter.setInsertionPointToStart(inner_loop.getBody());
+      k_idx = inner_loop.getInductionVar();
+    } else {
+      k_idx = c0;
+      auto denseAttr = mlir::DenseElementsAttr::get(
+          vectorType, rewriter.getZeroAttr(elementTypeA));
+      zero_vector = rewriter.create<arith::ConstantOp>(loc, denseAttr);
+    }
+
+    size_t numAccumulationLoops = accumulationLoops.size();
+    // Notice that A, B is dependent to accumlation axis
+    mlir::AffineExpr ATagExpr = rewriter.getAffineDimExpr(0) * -1;
+    mlir::AffineExpr BTagExpr = rewriter.getAffineDimExpr(0) * -1;
+    llvm::SmallVector<mlir::Value, 4> ATagOperands = {accumulationLoops.at(0).getInductionVar()};
+    llvm::SmallVector<mlir::Value, 4> BTagOperands = {accumulationLoops.at(0).getInductionVar()};
+
+    for (size_t i = 1; i < numAccumulationLoops; ++i) {
+      ATagExpr = ATagExpr + rewriter.getAffineDimExpr(i) * -1;
+      BTagExpr = BTagExpr + rewriter.getAffineDimExpr(i) * -1;
+      ATagOperands.push_back(accumulationLoops.at(i).getInductionVar());
+      BTagOperands.push_back(accumulationLoops.at(i).getInductionVar());
+    }
+
+    int ADimOffset = numAccumulationLoops;
+    int BDimOffset = numAccumulationLoops;
+
+    if (is_conv2d) { // innerloop : K_H, K_W, O_H, O_W
+      /* FIXME. this is totally heuristic based lowering... */
+      int64_t kW;
+      kW = getLoopUpperBound(innerLoops.at(1));
+      BTagOperands.push_back(innerLoops.at(0).getInductionVar());
+      BTagOperands.push_back(innerLoops.at(1).getInductionVar());
+      BDimOffset = BTagOperands.size();
+      BTagExpr = BTagExpr + \
+        rewriter.getAffineDimExpr(BDimOffset-2)*((N/subtileN)*(K/subtileK)*kW) + \
+        rewriter.getAffineDimExpr(BDimOffset-1)*((N/subtileN)*(K/subtileK));
+    }
+
+    // Create a dma_wait for B.
+    BTagExpr = BTagExpr + rewriter.getAffineDimExpr(BDimOffset).floorDiv((NStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*(K/KStep) + \
+      rewriter.getAffineDimExpr(BDimOffset+1).floorDiv((KStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*1;
+    auto BTagMap = mlir::AffineMap::get(BDimOffset+2, 0, BTagExpr);
+
+    Value n_tag_idx = N == subtileN ? c0 : n_idx; // check whether we need to tag from subtile
+    Value k_tag_idx = K == subtileK ? c0 : k_idx;
+    BTagOperands.push_back(n_tag_idx); //N_idx, K_Idx
+    BTagOperands.push_back(k_tag_idx);
+    auto BTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BTagMap, BTagOperands);
+    if (BDmaAsync)
+      rewriter.create<memref::DmaWaitOp>(loc, BDmaTag, ValueRange{BTagIdx}, numElements);
+
+    // For vpush weight loop part
+    for (int i=0; i<SYSTOLIC_SIZE; i+=nr_element) { // KxN
+      Value weight_vector;
+      if (i < K) {
+        Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
+        Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
+                                                        ValueRange{n_idx, k_idx, i_val, K_val, SYSTOLIC_SIZE_val});
+        Value w_x_idx = rewriter.create<affine::AffineApplyOp>(loc, spadXIdxMapAttr, ValueRange{spad_idx, N_val});
+        Value w_y_idx = rewriter.create<affine::AffineApplyOp>(loc, spadYIdxMapAttr, ValueRange{spad_idx, N_val});
+        // DMA has distributed N across vector lanes: consecutive elements in
+        // each lane's scratchpad are K values, not logical N columns. A
+        // transfer_read's default last-dimension bound (N) therefore masks out
+        // valid feed elements when N < vlen/16. Load the physical contiguous
+        // span, explicitly zero-padding a short K tail instead.
+        int readLength = std::min(nr_element, K - i);
+        auto readType = VectorType::get({readLength}, elementTypeA);
+        weight_vector = rewriter.create<vector::LoadOp>(
+            loc, readType, B, ValueRange{w_x_idx, w_y_idx});
+        // LLVM can scalarize a BF16 shuffle into scalar loads/broadcasts. In
+        // this lane-distributed scratchpad, that repeats lane 0's values in
+        // every lane. Perform the padding shuffle on integer transport bits.
+        weight_vector = rewriter.create<arith::BitcastOp>(
+            loc, VectorType::get({readLength}, rewriter.getI16Type()), weight_vector);
+        if (readLength < nr_element) {
+          Value zeroBits = rewriter.create<arith::BitcastOp>(
+              loc, VectorType::get({nr_element}, rewriter.getI16Type()), zero_vector);
+          weight_vector = rewriter.create<vector::InsertStridedSliceOp>(
+              loc, weight_vector, zeroBits,
+              ArrayRef<int64_t>{0}, ArrayRef<int64_t>{1});
+        }
+      } else {
+        weight_vector = rewriter.create<arith::BitcastOp>(
+            loc, VectorType::get({nr_element}, rewriter.getI16Type()), zero_vector);
+      }
+      rewriter.create<vcix::BinaryNoDestImmOp>(loc, vwpush_opcode, weight_vector, bf16ImmAttr, zeroImmAttr, rvl);
+    }
+
+    if (is_conv2d && inner_loop) { // return to inner loop location
+      tile_o_h_loop->moveBefore(inner_loop.getBody(), std::prev(inner_loop.getBody()->end()));
+      rewriter.setInsertionPointToStart(tile_o_h_loop.getBody());
+      tile_o_w_loop->moveBefore(tile_o_h_loop.getBody(), tile_o_h_loop.getBody()->begin());
+      rewriter.setInsertionPoint(&tile_o_w_loop.getBody()->back());
+    } else if (is_conv2d) {
+      tile_o_h_loop->moveBefore(&tile_k_w_loop.getBody()->back());
+      rewriter.setInsertionPoint(&tile_o_w_loop.getBody()->back());
+    }
+
+    if (M > push_length) {
+      // M Loop
+      inner_loop = rewriter.create<affine::AffineForOp>(loc, 0, M/push_length, 1);
+      inner_loop->setAttr("inner_loop", rewriter.getBoolAttr(true));
+      rewriter.setInsertionPointToStart(inner_loop.getBody());
+      m_idx = inner_loop.getInductionVar();
+    } else {
+      m_idx = c0;
+    }
+
+    if (is_conv2d) { // innerloop : K_H, K_W, O_H, O_W
+      /* FIXME. this is totally heuristic based lowering... */
+      Value k_h = innerLoops.at(0).getInductionVar();
+      Value k_w = innerLoops.at(1).getInductionVar();
+      Value o_h = innerLoops.at(2).getInductionVar();
+      Value o_w = innerLoops.at(3).getInductionVar();
+      // find affine.apply using loop index (k_h, k_w, o_h, o_w)
+      int64_t offset_w = 1;
+      int64_t offset_h = 1;
+      int64_t coeff_h = 1;
+      int64_t kW = getLoopUpperBound(innerLoops.at(1));
+      int64_t oW = getLoopUpperBound(innerLoops.at(3));
+      affineForOp = innerLoops.at(3);
+      affineForOp->walk([&](mlir::Operation *nestedOp) {
+        if (auto affineApplyOp = llvm::dyn_cast_or_null<affine::AffineApplyOp>(nestedOp)) { // warning. this part is very heuritic
+          if (affineApplyOp.getOperand(0) == o_h && affineApplyOp.getOperand(1) == k_h) {
+            AffineMap map = affineApplyOp.getAffineMap();
+            AffineExpr expr = map.getResult(0);
+            expr.walk([&](AffineExpr subExpr) {
+              if (auto constExpr = dyn_cast<AffineConstantExpr>(subExpr)) {
+                offset_h = constExpr.getValue();
+              }
+            });
+          }
+          if (affineApplyOp.getOperand(0) == o_w && affineApplyOp.getOperand(1) == k_w) {
+            AffineMap map = affineApplyOp.getAffineMap();
+            AffineExpr expr = map.getResult(0);
+            expr.walk([&](AffineExpr subExpr) {
+              if (auto constExpr = dyn_cast<AffineConstantExpr>(subExpr)) {
+                offset_w = constExpr.getValue();
+              }
+            });
+          }
+        }
+      });
+      coeff_h = 1 + (oW - 1) * offset_w + (kW - 1);
+      ATagOperands.push_back(innerLoops.at(2).getInductionVar());
+      ATagOperands.push_back(innerLoops.at(3).getInductionVar());
+      ADimOffset = ATagOperands.size();
+        ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset-2)*((K/subtileK)*(M/subtileM)*offset_h*coeff_h) + \
+                              rewriter.getAffineDimExpr(ADimOffset-1)*((K/subtileK)*(M/subtileM)*offset_w);
+    }
+
+    // Create a dma_wait for A.
+    ATagExpr = ATagExpr + rewriter.getAffineDimExpr(ADimOffset)*(M/MStep) + \
+      rewriter.getAffineDimExpr(ADimOffset+1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE);
+    auto ATagMap = mlir::AffineMap::get(ADimOffset+2, 0, ATagExpr);
+
+    Value m_tag_idx = M == subtileM ? c0 : m_idx;
+    ATagOperands.push_back(k_tag_idx);    //K_idx, m_idx
+    ATagOperands.push_back(m_tag_idx);
+    auto ATagIdx = rewriter.create<affine::AffineApplyOp>(loc, ATagMap, ATagOperands);
+    if (ADmaAsync)
+      rewriter.create<memref::DmaWaitOp>(loc, ADmaTag, ValueRange{ATagIdx}, numElements);
+
+    // Create a dma_wait for Bias.
+    if (BiasDmaTag) {
+      /* Bias could be 1D or 2D */
+      Value first_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : n_tag_idx;
+      Value third_index = BiasDMAIndices[0].getDefiningOp<mlir::arith::ConstantIndexOp>() ? c0 : m_tag_idx;
+      mlir::AffineExpr BiasTagExpr = rewriter.getAffineDimExpr(0).floorDiv((NStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE)*(M/MStep) + rewriter.getAffineDimExpr(1).floorDiv((MStep+SYSTOLIC_SIZE-1)/SYSTOLIC_SIZE); // N, M
+      auto BiasTagMap = mlir::AffineMap::get(2, 0, BiasTagExpr);
+      auto BiasTagIdx = rewriter.create<affine::AffineApplyOp>(loc, BiasTagMap, ValueRange{first_index, third_index});
+      if (BiasDmaAsync)
+        rewriter.create<memref::DmaWaitOp>(loc, BiasDmaTag, ValueRange{BiasTagIdx}, numElements);
+    }
+
+    // For vpush input loop part
+    int64_t M_LOOP = M > push_length ? push_length : M;
+
+    for (int i=0; i<M_LOOP; i+=nr_element) { // MxK
+      Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
+      Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
+                                                      ValueRange{k_idx, m_idx, i_val, M_val, vector_elements});
+      Value x_idx = rewriter.create<affine::AffineApplyOp>(loc, spadXIdxMapAttr, ValueRange{spad_idx, K_val});
+      Value y_idx = rewriter.create<affine::AffineApplyOp>(loc, spadYIdxMapAttr, ValueRange{spad_idx, K_val});
+      auto input_vector = rewriter.create<vector::TransferReadOp>(
+                                          loc, vectorMType, A, ValueRange{x_idx, y_idx});
+      Value input_bits = rewriter.create<arith::BitcastOp>(loc, VectorType::get({nr_m_element}, rewriter.getI16Type()), input_vector);
+      rewriter.create<vcix::BinaryNoDestImmOp>(loc, vipush_opcode, input_bits, bf16ImmAttr, zeroImmAttr, rvl);
+    }
+
+    // Compute instruction
+    rewriter.create<vcix::UnaryNoDestImmOp>(loc, compute_opcode, zeroImmAttr, compute_cycle, zeroImmAttr, sew, lmul, rvl);
+
+    // For vpop loop part: FP32 outputs have half the BF16 feed width.
+    for (int i=0; i<M_LOOP; i+=nr_output_element) { // MxN
+      Value i_val = rewriter.create<mlir::arith::ConstantIndexOp>(rewriter.getUnknownLoc(), i);
+      Value spad_idx = rewriter.create<affine::AffineApplyOp>(loc, spadIdxMapAttr,
+                                                      ValueRange{n_idx, m_idx, i_val, M_val, vector_elements});
+      Value vpop = rewriter.create<vcix::UnaryImmOp>(loc, vectorOutputType, vpop_opcode, zeroImmAttr, zeroImmAttr, rvl);
+      Value x_idx = rewriter.create<affine::AffineApplyOp>(loc, spadXIdxMapAttr, ValueRange{spad_idx, N_val});
+      Value y_idx = rewriter.create<affine::AffineApplyOp>(loc, spadYIdxMapAttr, ValueRange{spad_idx, N_val});
+      auto prev_output = rewriter.create<vector::TransferReadOp>(
+                                          vpop.getLoc(), vectorOutputType, C, ValueRange{x_idx, y_idx});
+      VectorType vt = cast<VectorType>(prev_output.getType());
+      if (vt.getElementType().isInteger()) {
+        auto output_vector = rewriter.create<arith::AddIOp>(loc, prev_output, vpop);
+        rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{x_idx, y_idx});
+      }
+      else if (isa<FloatType>(vt.getElementType()))  {
+        auto output_vector = rewriter.create<arith::AddFOp>(loc, prev_output, vpop);
+        rewriter.create<vector::TransferWriteOp>(output_vector.getLoc(), output_vector, C, ValueRange{x_idx, y_idx});
+      } else {
+        op.emitError () << "expected same type";
+        return failure();
+      }
+    }
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct BF16ToVCIX
+    : PassWrapper<BF16ToVCIX, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BF16ToVCIX)
+    // Define an integer option with a default value
+  StringRef getArgument() const final { return "pytorchsim-bf16-to-vcix"; }
+  StringRef getDescription() const final {
+    return "Lower BF16-input, FP32-accumulator matmul to PyTorchSim VCIX";
+  }
+  BF16ToVCIX() = default;
+  BF16ToVCIX(const BF16ToVCIX &) {}
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<arith::ArithDialect, func::FuncDialect, math::MathDialect,
+                    vcix::VCIXDialect, vector::VectorDialect, affine::AffineDialect, linalg::LinalgDialect,
+                    memref::MemRefDialect, LLVM::LLVMDialect>();
+  }
+
+  void runOnOperation() override {
+    MLIRContext *ctx = &getContext();
+    RewritePatternSet patterns(ctx);
+
+    SYSTOLIC_SIZE = systolicSize;
+    VLEN = vlen;
+    patterns.add<MatmulOpLowering>(ctx);
+    ConversionTarget target(getContext());
+    target.addDynamicallyLegalOp<linalg::MatmulOp>([](linalg::MatmulOp op) {
+      auto type = dyn_cast<ShapedType>(op.getInputs()[0].getType());
+      return !type || !type.getElementType().isBF16();
+    });
+    target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+    if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
+      signalPassFailure();
+    }
+  }
+
+
+private:
+  Option<int> systolicSize{*this, "systolic-array-size",
+                          llvm::cl::desc("Systolic array size (KxK)"),
+                          llvm::cl::init(128)};
+  Option<int> vlen{*this, "vlen",
+                   llvm::cl::desc("vector register size(bit)"),
+                   llvm::cl::init(128)};
+};
+
+} // namespace
+namespace test {
+void registerBF16ToVCIXPass() { PassRegistration<BF16ToVCIX>(); }
+} // namespace test
+} // namespace mlir
+
+extern "C" LLVM_ATTRIBUTE_WEAK mlir::PassPluginLibraryInfo mlirGetPassPluginInfo() {
+  return {MLIR_PLUGIN_API_VERSION, "PyTorchSimBF16", "0.1", []() {
+    mlir::test::registerBF16ToVCIXPass();
+  }};
+}
+
+extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPluginInfo() {
+  return {MLIR_PLUGIN_API_VERSION, "PyTorchSimBF16Dialects", "0.1", [](mlir::DialectRegistry *registry) {
+    registry->insert<mlir::vcix::VCIXDialect>();
+  }};
+}

@@ -1,0 +1,51 @@
+--- a/riscv/insns/torchsim_i_vpush.h
++++ b/riscv/insns/torchsim_i_vpush.h
+@@ -19,9 +19,16 @@
+             val = static_cast<float>(P.VU.elt<int8_t>(vs, vreg_inx, vu_idx));
+             break;
+           case e16: {
+-            float16_t fp16 = P.VU.elt<float16_t>(vs, vreg_inx, vu_idx);
+-            float32_t fp32 = f16_to_f32(fp16);
+-            memcpy(&val, &fp32.v, sizeof(float));
++            // Custom VCIX immediate rs1=1 selects BF16; rs1=0 retains FP16.
++            require(insn.rs1() <= 1);
++            if (insn.rs1() == 1) {
++                uint32_t bits = uint32_t(P.VU.elt<uint16_t>(vs, vreg_inx, vu_idx)) << 16;
++                memcpy(&val, &bits, sizeof(float));
++            } else {
++                float16_t fp16 = P.VU.elt<float16_t>(vs, vreg_inx, vu_idx);
++                float32_t fp32 = f16_to_f32(fp16);
++                memcpy(&val, &fp32.v, sizeof(float));
++            }
+             break;
+           }
+           case e32:
+@@ -42,4 +49,4 @@
+ }
+ P.VU.vstart->write(0);
+ P.SA->n_input += vl;
+-P.SA->compute();
+\ No newline at end of file
++P.SA->compute();
+--- a/riscv/insns/torchsim_w_vpush.h
++++ b/riscv/insns/torchsim_w_vpush.h
+@@ -19,9 +19,16 @@
+             val = static_cast<float>(P.VU.elt<int8_t>(vs, vreg_inx, vu_idx));
+             break;
+           case e16: {
+-            float16_t fp16 = P.VU.elt<float16_t>(vs, vreg_inx, vu_idx);
+-            float32_t fp32 = f16_to_f32(fp16);
+-            memcpy(&val, &fp32.v, sizeof(float));
++            // Custom VCIX immediate rs1=1 selects BF16; rs1=0 retains FP16.
++            require(insn.rs1() <= 1);
++            if (insn.rs1() == 1) {
++                uint32_t bits = uint32_t(P.VU.elt<uint16_t>(vs, vreg_inx, vu_idx)) << 16;
++                memcpy(&val, &bits, sizeof(float));
++            } else {
++                float16_t fp16 = P.VU.elt<float16_t>(vs, vreg_inx, vu_idx);
++                float32_t fp32 = f16_to_f32(fp16);
++                memcpy(&val, &fp32.v, sizeof(float));
++            }
+             break;
+           }
+           case e32:

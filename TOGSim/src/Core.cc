@@ -1,5 +1,6 @@
 #include "Core.h"
 #include "CoreTraceLog.h"
+#include "TileGraph.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
 
@@ -109,6 +110,14 @@ void Core::compute_cycle() {
   sa_cycle();
 }
 
+void Core::issue_dma(const std::shared_ptr<Instruction>& inst) {
+  auto tile = static_cast<Tile*>(inst->get_owner())->shared_from_this();
+  if (!_dma_tiles.emplace(inst.get(), tile).second)
+    throw std::logic_error("DMA instruction issued twice");
+  tile->get_owner()->start_dma();
+  _dma.issue_tile(inst);
+}
+
 void Core::dma_cycle() {
   /* Check finished dma operation */
   while(_dma_finished_queue.size()) {
@@ -138,6 +147,15 @@ void Core::dma_cycle() {
         finish_instruction(wait_inst);
       }
     }
+    // MOVOUT's INST_FINISHED marks injection, not memory acknowledgement.
+    // Expose both without changing its existing intra-kernel dependencies.
+    if (instruction->is_dma_write())
+      finish_instruction(instruction, InstFinishTraceTag::DmaRespComplete);
+    auto owner = _dma_tiles.find(instruction.get());
+    if (owner == _dma_tiles.end())
+      throw std::logic_error("DMA response without a retained owner");
+    owner->second->get_owner()->finish_dma();
+    _dma_tiles.erase(owner);
     _dma_finished_queue.erase(_dma_finished_queue.begin());
   }
 
@@ -163,17 +181,22 @@ void Core::dma_cycle() {
                                                    *finished_inst));
       }
       /*Pass to waiting queue */
-      _dma_waiting_queue[finished_inst.get()] = std::move(finished_inst);
+      // Zero-length DMA, or responses returned before injection was retired,
+      // will never trigger another response callback. Complete them explicitly.
+      if (finished_inst->get_waiting_request() == 0)
+        _dma_finished_queue.push_back(std::move(finished_inst));
+      else
+        _dma_waiting_queue[finished_inst.get()] = std::move(finished_inst);
     }
 
     /* Issue new DMA operation */
     if (!_ld_inst_queue.empty()) {
       std::shared_ptr<Instruction> inst = _ld_inst_queue.front();
-      _dma.issue_tile(inst);
+      issue_dma(inst);
       _ld_inst_queue.pop();
     } else if (!_st_inst_queue.empty()) {
       std::shared_ptr<Instruction> inst = _st_inst_queue.front();
-      _dma.issue_tile(inst);
+      issue_dma(inst);
       _st_inst_queue.pop();
     } else {
       /* DMA is idle */
@@ -390,6 +413,7 @@ void Core::finish_instruction(std::shared_ptr<Instruction>& inst, InstFinishTrac
 bool Core::running() {
   bool running = false;
   running = running || _tiles.size() > 0;
+  running = running || !_finished_tiles.empty() || !_dma_tiles.empty();
   running = running || !_vu_compute_pipeline.empty();
   for (int i=0; i<_num_systolic_array_per_core;i++)
     running = running || !_sa_compute_pipeline.at(i).empty();
@@ -419,9 +443,9 @@ void Core::push_memory_response(mem_fetch* response) {
       std::shared_ptr<Instruction> moved_inst = std::move(it->second);
       _dma_finished_queue.push_back(std::move(moved_inst));
       _dma_waiting_queue.erase(it);
-    } else {
-      assert(true || "Can't happend...!");
-    }
+    } else if (owner_inst != _dma.get_current_inst().get()) {
+      throw std::logic_error("Memory response has no active DMA instruction");
+    } // Current DMA is picked up by dma_cycle(), including already-returned responses.
   }
   _stat_mem_response++;
   delete response;

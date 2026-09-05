@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 from torch import empty_strided
@@ -26,12 +27,17 @@ func.func @{{ KERNEL_NAME }}{{kernel.def_kernel(inputs=[X, W, Bias], outputs=[Y]
   {{ kernel.def_sram_buffer("X", X_tile_desc, indent_size=2) }}
   {{ kernel.def_sram_buffer("W", W_tile_desc, indent_size=2) }}
   {{ kernel.def_sram_buffer("Y", Y_tile_desc, indent_size=2) }}
-  {% if not Bias %}
+  {% if DATA_STYPE == "bf16" %}
+  {{ kernel.def_sram_buffer("Acc", Acc_tile_desc, indent_size=2) }}
+  %acc_zero = arith.constant dense<0.0> : vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xf32>
+  {% elif not Bias %}
   %v0 = arith.constant dense<0.0> : vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}x{{DATA_STYPE}}>{% endif %}
   {{ kernel.def_local_vars(indent_size=2) }}
   affine.for %index0 = 0 to {{ M }} step {{ TILE_M }} {
     affine.for %index1 = 0 to {{ N }} step {{ TILE_N }} {
-      {%- if Bias %}
+      {%- if DATA_STYPE == "bf16" %}
+      affine.vector_store %acc_zero, %Acc_buffer[0, 0] : {{ Acc_tile_desc.get_mlir_shape("f32") }}, vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xf32>
+      {%- elif Bias %}
       {{ kernel.def_dma_op("MVIN", "Bias", Bias_idx, Bias_tile_desc, subtile_size=[SUB_TILE_M, SUB_TILE_N], indent_size=6) }}
       {%- else %}
       affine.vector_store %v0, %Y_buffer[0, 0] : {{ Y_tile_desc.get_mlir_shape(DATA_STYPE) }}, vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}x{{DATA_STYPE}}>
@@ -45,8 +51,25 @@ func.func @{{ KERNEL_NAME }}{{kernel.def_kernel(inputs=[X, W, Bias], outputs=[Y]
         {{ kernel.def_dma_op("MVIN", "W", W_idx, W_tile_desc, subtile_size=[SUB_TILE_K, SUB_TILE_N], indent_size=8) }}
         {%- endif %}
         linalg.matmul ins(%X_buffer, %W_buffer : {{ X_tile_desc.get_mlir_shape(DATA_STYPE) }}, {{ W_tile_desc.get_mlir_shape(DATA_STYPE) }})
+        {% if DATA_STYPE == "bf16" %}
+                outs(%Acc_buffer : {{ Acc_tile_desc.get_mlir_shape("f32") }})
+        {% else %}
                 outs(%Y_buffer : {{ Y_tile_desc.get_mlir_shape(DATA_STYPE) }})
+        {% endif %}
       } { accumulation_loop=true, subtile_loop="k" }
+      {% if DATA_STYPE == "bf16" %}
+      %acc_result = affine.vector_load %Acc_buffer[0, 0] : {{ Acc_tile_desc.get_mlir_shape("f32") }}, vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xf32>
+      {% if Bias %}
+      {{ kernel.def_dma_op("MVIN", "Bias", Bias_idx, Bias_tile_desc, subtile_size=[TILE_M, TILE_N], async_type=False, indent_size=6) }}
+      %bias_bf16 = affine.vector_load %Y_buffer[0, 0] : {{ Y_tile_desc.get_mlir_shape(DATA_STYPE) }}, vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xbf16>
+      %bias_f32 = arith.extf %bias_bf16 : vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xbf16> to vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xf32>
+      %biased_result = arith.addf %acc_result, %bias_f32 : vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xf32>
+      %rounded_result = arith.truncf %biased_result : vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xf32> to vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xbf16>
+      {% else %}
+      %rounded_result = arith.truncf %acc_result : vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xf32> to vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xbf16>
+      {% endif %}
+      affine.vector_store %rounded_result, %Y_buffer[0, 0] : {{ Y_tile_desc.get_mlir_shape(DATA_STYPE) }}, vector<{{ kernel.get_spad_size_per_lane(TILE_M, TILE_N) }}xbf16>
+      {% endif %}
       {{kernel.store_output(indent_size=6)}}
     } { outer_loop=true, subtile_loop="n"  }
   } { outer_loop=true, subtile_loop="m" }
@@ -107,7 +130,8 @@ class MLIRGemmTemplate(MLIRTemplate):
         super().__init__("kernel", input_nodes, layout, input_reorder)
         self.support_epilogue_fusion = True
         self.support_prologue_fusion = True
-        self.support_reduction_fusion = True
+        # The transposed reduction template has no FP32 accumulator buffer yet.
+        self.support_reduction_fusion = mlir_common.DTYPE_TO_MLIR[input_nodes[0].get_dtype()] != "bf16"
 
     def render(self,
                kernel: MLIRTemplateKernel,
@@ -129,6 +153,8 @@ class MLIRGemmTemplate(MLIRTemplate):
             nr_rdim = 0
             epilogue_dim_aliasing = {}
         elif n_epilogue_node>=1 and epilogue_nodes[0].is_reduction():
+            if mlir_common.DTYPE_TO_MLIR[X.get_dtype()] == "bf16":
+                raise NotImplementedError("BF16 GEMM reduction fusion requires a separate reduction kernel")
             template = GEMM_REDUCTION_TEMPLATE
             epilogue_dim_aliasing = {"index0":"index1", "index1":"index0"}
             nr_rdim = 1
@@ -167,6 +193,8 @@ class MLIRGemmTemplate(MLIRTemplate):
         Y_tile_desc = mlir_common.MLIRMultiDimTile(Y_tile_size, kernel.vector_lane, vlane_split_axis, vlane_stride)
         Y_tile_desc.set_tile_size_stride(Y_tile_size, Y_tile_stride)
         Y_tile_desc.set_name("Y_buffer")
+        Acc_tile_desc = copy.deepcopy(Y_tile_desc)
+        Acc_tile_desc.set_name("Acc_buffer")
         Y_stride = Y.get_layout().stride if N>1 else [Y.get_layout().stride[0], 0]
         if nr_rdim == 0:
             Y_idx = [sympy.Symbol("index0") * Y_stride[0], sympy.Symbol("index1") * Y_stride[1]]
@@ -209,6 +237,7 @@ class MLIRGemmTemplate(MLIRTemplate):
             X_tile_desc = X_tile_desc,
             W_tile_desc = W_tile_desc,
             Y_tile_desc = Y_tile_desc,
+            Acc_tile_desc = Acc_tile_desc,
             Bias_tile_desc = Bias_tile_desc,
             epilogue_nodes = epilogue_nodes,
             prologue_nodes = prologue_nodes,
@@ -329,7 +358,9 @@ class MLIRGemmTemplate(MLIRTemplate):
         else:
             # case 2: use heuristic mapping
             min_tile = (n_extra_node + n_prologue_node) == 0
-            tile_candidates = kernel.gemm_combination_mapping(M, N, K, max(n_extra_read-2, 0), n_prologue_node, min_tile=True, precision_bytes=precision_bytes)
+            # FP32 partial sums occupy two additional BF16-sized output tiles.
+            accumulator_tiles = 2 if mlir_common.DTYPE_TO_MLIR[self.input_nodes[0].get_dtype()] == "bf16" else 0
+            tile_candidates = kernel.gemm_combination_mapping(M, N, K, max(n_extra_read-2, 0) + accumulator_tiles, n_prologue_node, min_tile=True, precision_bytes=precision_bytes)
 
         # Edge case
         if (M == 0) or (N == 0) or (K == 0):

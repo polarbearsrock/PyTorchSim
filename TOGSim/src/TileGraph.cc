@@ -15,7 +15,9 @@ void TileSubGraph::add_tile(std::shared_ptr<Tile> tile) {
 }
 
 void TileSubGraph::finish_tile(std::shared_ptr<Tile> tile) {
-  /* TODO. */
+  if (_inflight_tiles == 0)
+    throw std::logic_error("Tile completion without an outstanding tile");
+  --_inflight_tiles;
   tile->finish_tile();
   for (auto child_tile_ptr: tile->get_child_tile()) {
     if (child_tile_ptr->get_ready_counter())
@@ -41,6 +43,7 @@ std::shared_ptr<Tile> TileSubGraph::get_tile() {
   } else {
     std::shared_ptr<Tile> ret = _ready_tile_queue.top();
     _ready_tile_queue.pop();
+    ++_inflight_tiles;
     return ret;
   }
 }

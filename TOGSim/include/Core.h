@@ -50,6 +50,7 @@ class Core {
 
  protected:
   void dma_cycle();
+  void issue_dma(const std::shared_ptr<Instruction>& inst);
   void compute_cycle();
   void vu_cycle();
   void sa_cycle();
@@ -98,6 +99,9 @@ class Core {
   std::queue<std::shared_ptr<Instruction>> _st_inst_queue;
 
   std::unordered_map<Instruction*, std::shared_ptr<Instruction>> _dma_waiting_queue;
+  // An async load/store can retire before its responses return. Keep its tile
+  // (and hence subgraph) alive until memory completion, independently of slots.
+  std::unordered_map<Instruction*, std::shared_ptr<Tile>> _dma_tiles;
   std::vector<std::shared_ptr<Instruction>> _dma_finished_queue;
   /* Interconnect queue */
   std::queue<mem_fetch*> _request_queue;
