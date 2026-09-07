@@ -45,7 +45,7 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
 
     def test_analysis_module_entry_points(self):
-        for module in ("dependency_audit", "trace_summary", "operator_timeline"):
+        for module in ("dependency_audit", "trace_summary", "operator_timeline", "kernel_inventory"):
             with self.subTest(module=module):
                 result = command(sys.executable, "-B", "-m", f"{PACKAGE}.analysis.{module}", "--help")
                 self.assertIn("usage:", result.stdout)

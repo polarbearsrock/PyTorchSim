@@ -1,0 +1,2 @@
+# Unified-diff context prefixes intentionally precede blank lines and tabs.
+matrix-vl.patch whitespace=-blank-at-eol,-space-before-tab

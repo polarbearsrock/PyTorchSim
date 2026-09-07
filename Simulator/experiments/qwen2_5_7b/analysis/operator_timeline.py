@@ -56,6 +56,9 @@ def main():
     parser.add_argument("run", type=Path)
     parser.add_argument("analysis", type=Path, help="trace_summary.py output directory")
     args = parser.parse_args()
+    if (args.run / "decoder_phases.json").exists():
+        parser.error("The fixed operator labels here describe only the historical attention diagnostic. "
+                     "Use trace_summary for decoder occupancy; decoder operator attribution is not implemented.")
     output = args.analysis.resolve()
     if not output.is_relative_to(Path(os.environ["TMPDIR"]).resolve()):
         parser.error("Output must be under TMPDIR")

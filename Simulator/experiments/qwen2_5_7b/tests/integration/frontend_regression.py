@@ -12,12 +12,14 @@ from unittest.mock import patch
 sys.path.insert(0, os.environ["TORCHSIM_DIR"])
 
 import numpy as np
+import sympy
 import torch
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch._inductor.virtualized import V
 from torch.utils._sympy.value_ranges import ValueRanges
 
 from PyTorchSimFrontend.mlir.mlir_ops import ExtensionOverrides as Ops
-from PyTorchSimFrontend.mlir.mlir_common import MLIR_INF
+from PyTorchSimFrontend.mlir.mlir_common import BaseMLIRKernel, MLIR_INF, MLIRMultiDimTile
 from PyTorchSimFrontend.extension_codecache import mlir_compile_command, mlir_gem5_compile_command, check_indirect_timing_supported
 from Simulator.simulator import FunctionalSimulator
 
@@ -128,6 +130,35 @@ class FrontendTests(unittest.TestCase):
         with V.set_kernel_handler(SimpleNamespace(var_info={"x": [8, "bf16"]})):
             with self.assertRaises(ValueError):
                 Ops.bitwise_not("x")
+
+
+class ImplicitTileTests(unittest.TestCase):
+    def test_divisor_applies_to_its_symbol_not_dictionary_position(self):
+        index0, index1 = sympy.symbols("index0 index1")
+        constraints = {
+            index1: {ModularIndexing(index1, 1, 1152)},
+            index0: {ModularIndexing(index0, 7, 4)},
+        }
+        for items in (list(constraints.items()), list(reversed(list(constraints.items())))):
+            with self.subTest(order=[str(key) for key, _ in items]):
+                tile = MLIRMultiDimTile([256, 256], 128, 1, 2)
+                tile.apply_constraints(dict(items), [28, 1152])
+                self.assertEqual(tile.get_tile_size(), [7, 256])
+                self.assertEqual([constraint.fixed for constraint in tile.tile_constraint], [True, False])
+
+    def test_sparse_axis_constraints(self):
+        index2 = sympy.Symbol("index2")
+        tile = MLIRMultiDimTile([2, 256, 128], 128, 1, 2)
+        tile.apply_constraints({index2: {ModularIndexing(index2, 3, 4)}}, [2, 28, 12])
+        self.assertEqual(tile.get_tile_size(), [2, 256, 3])
+
+    def test_real_decode_read_expression(self):
+        c0, c1 = sympy.symbols("c0 c1")
+        operand = SimpleNamespace(index=c1 + 1152 * FloorDiv(c0, 7), ranges={c0: 28, c1: 1152})
+        constraints = BaseMLIRKernel.extract_dividers(None, [operand])
+        tile = MLIRMultiDimTile([256, 256], 128, 1, 2)
+        tile.apply_constraints(constraints, [28, 1152])
+        self.assertEqual(tile.get_tile_size(), [7, 256])
 
 
 class RawIOTests(unittest.TestCase):

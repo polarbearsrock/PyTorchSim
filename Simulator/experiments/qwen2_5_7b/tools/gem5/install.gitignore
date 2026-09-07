@@ -1,0 +1,5 @@
+# Local runtime installation files, never commit the executable to the fork.
+/bin/gem5.opt
+/build.json
+/installation.json
+/pytorchsim-patches/

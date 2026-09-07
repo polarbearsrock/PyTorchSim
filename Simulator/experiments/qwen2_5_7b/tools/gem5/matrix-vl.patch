@@ -1,0 +1,64 @@
+Backport only the matrix vector-length accounting from PSAL-POSTECH/gem5
+commit 3ac8959462ad42e5096598594d165d5887ce5b39 onto release v1.0.1
+(0511678eb5334c1102725cd928f2d3de8720d1bc). No opcode or VPU timing changes.
+
+--- a/src/cpu/minor/execute.cc
++++ b/src/cpu/minor/execute.cc
+@@ -39,6 +39,7 @@
+ 
+ #include <functional>
+ 
++#include "arch/riscv/insts/static_inst.hh"
+ #include "cpu/minor/cpu.hh"
+ #include "cpu/minor/exec_context.hh"
+ #include "cpu/minor/fetch1.hh"
+@@ -75,6 +76,19 @@ int computeCycle(const gem5::minor::MinorDynInst& inst) {
+     }
+ }
+ 
++// Number of vector elements this systolic-array instruction operates on,
++// read from the instruction's actual vl. Used instead of a hardcoded push/pop
++// size (which assumed vlmul==1) so f16 pushes and f32 pops stay balanced.
++int vectorElemCount(const gem5::minor::MinorDynInst &inst) {
++    if (inst.staticInst) {
++        auto *rv = dynamic_cast<const gem5::RiscvISA::RiscvStaticInst *>(
++            inst.staticInst.get());
++        if (rv)
++            return rv->machInst.vl;
++    }
++    return 8;
++}
++
+ namespace gem5
+ {
+ 
+@@ -866,7 +880,8 @@ Execute::issue(ThreadID thread_id)
+ //								systolicFU->compute(computeCycle(*inst));
+ 							} else if (inst->staticInst->opClass() == gem5::enums::CustomMatMulvpop) {
+ 								SystolicArrayFU *systolicFU = const_cast<SystolicArrayFU*>(dynamic_cast<const SystolicArrayFU*>(&fu->description));
+-								if (systolicFU->is_popable(8)) {
++								// Use this inst's vl instead of a hardcoded size
++								if (systolicFU->is_popable(vectorElemCount(*inst))) {
+ 									DPRINTF(PyTorchSim, "%s Issue at %d\n", *inst, cpu.curCycle());
+ //									systolicFU->vpop(8); // temporarly fixed as vlmul == 1
+ 								} else {
+@@ -1108,15 +1123,16 @@ Execute::commitInst(MinorDynInstPtr inst, bool early_memory_issue,
+ 			if (fu->description.unitType == "SystolicArray") {\
+ 				SystolicArrayFU *systolicFU = const_cast<SystolicArrayFU*>(dynamic_cast<const SystolicArrayFU*>(&fu->description));
+ 
++				// push/pop size is this inst's vl, not a hardcoded value
+ 				if (inst->staticInst->opClass() == gem5::enums::CustomMatMulvpop) {
+ 					DPRINTF(SystolicArray, "Commit vpop.v\n");
+-					systolicFU->vpop(8);
++					systolicFU->vpop(vectorElemCount(*inst));
+ 				} else if (inst->staticInst->opClass() == gem5::enums::CustomMatMulwVpush) {
+ 					DPRINTF(SystolicArray, "Commit vpush_weight.v\n");
+-					systolicFU->pushWeight(8, uint64_t(cpu.curCycle()));
++					systolicFU->pushWeight(vectorElemCount(*inst), uint64_t(cpu.curCycle()));
+ 				} else if (inst->staticInst->opClass() == gem5::enums::CustomMatMuliVpush) {
+ 					DPRINTF(SystolicArray, "Commit vpush_input.v\n");
+-					systolicFU->pushInput(8, uint64_t(cpu.curCycle()));
++					systolicFU->pushInput(vectorElemCount(*inst), uint64_t(cpu.curCycle()));
+ 				} else {
+ 					DPRINTF(SystolicArray, "Not Supported Instruction %s\n", inst->staticInst->getName());
+ 				}

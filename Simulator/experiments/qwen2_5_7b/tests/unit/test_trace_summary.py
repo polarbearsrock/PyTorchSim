@@ -1,6 +1,6 @@
 import unittest
 
-from Simulator.experiments.qwen2_5_7b.analysis.trace_summary import analyze, merge, overlap
+from Simulator.experiments.qwen2_5_7b.analysis.trace_summary import activity_state_cycles, analyze, check_run_status, merge, overlap
 
 
 def event(cycle, action, identity, kind, latency, hidden):
@@ -27,10 +27,34 @@ def sample_log():
 
 
 class TraceTests(unittest.TestCase):
+    def test_exploratory_analysis_never_accepts_an_execution_failure(self):
+        check_run_status({"status": "passed"})
+        result = {"status": "completed_with_numerical_mismatch",
+                  "arguments": {"allow_numerical_mismatch": True},
+                  "probe": {"numerical_status": "failed"}}
+        with self.assertRaises(ValueError):
+            check_run_status(result)
+        check_run_status(result, True)
+        with self.assertRaises(ValueError):
+            check_run_status({**result, "status": "failed"}, True)
+        with self.assertRaises(ValueError):
+            check_run_status({**result, "arguments": {}}, True)
+
     def test_interval_union_and_clipping(self):
         intervals = merge([(4, 8), (1, 5), (8, 10), (12, 15)])
         self.assertEqual(intervals, [[1, 10], [12, 15]])
         self.assertEqual(overlap(intervals, 3, 13), 8)
+
+    def test_simultaneous_states_are_exact_and_clip_phase_boundaries(self):
+        occupied = {"VPU": [(1, 5)], "MXU0": [(2, 6)], "MXU1": [(3, 4)]}
+        counts = activity_state_cycles(occupied, 0, 7)
+        self.assertEqual(counts, {"none": 2, "VPU": 1, "MXU0": 1, "VPU+MXU0": 2,
+                                  "MXU1": 0, "VPU+MXU1": 0, "MXU0+MXU1": 0,
+                                  "VPU+MXU0+MXU1": 1})
+        clipped = activity_state_cycles(occupied, 3, 5)
+        self.assertEqual(clipped["VPU+MXU0+MXU1"], 1)
+        self.assertEqual(clipped["VPU+MXU0"], 1)
+        self.assertEqual(sum(clipped.values()), 2)
 
     def test_queue_assignment_and_native_counter_replay(self):
         jobs, occupied, _, total, native = analyze(sample_log())

@@ -73,6 +73,15 @@ Neither the container image nor its bundled LLVM/gem5 executables is overwritten
 
 ## Build and select the toolchain
 
+For BF16 timing, also select the [corrected gem5 installation](gem5.md):
+
+```bash
+export QWEN_GEM5_ROOT=/data2/s2chitni/psal-postech/gem5
+```
+
+The original image's gem5 undercounts wide BF16 matrix feeds and can stall.
+The gem5 selection is independent of the Spike/compiler selections below.
+
 From the repository root:
 
 ```bash
@@ -122,6 +131,9 @@ bash Simulator/experiments/qwen2_5_7b/run.sh toolchain python -B -m Simulator.ex
 # Batched products, narrow/short tiles, and exact dynamic table lookup.
 bash Simulator/experiments/qwen2_5_7b/run.sh toolchain python -B -m Simulator.experiments.qwen2_5_7b.tests.integration.batched_matmul
 bash Simulator/experiments/qwen2_5_7b/run.sh toolchain python -B -m Simulator.experiments.qwen2_5_7b.tests.integration.indirect_lookup
+
+# Exact upstream GQA value expansion, including contiguous decode-cache casts.
+bash Simulator/experiments/qwen2_5_7b/run.sh toolchain python -B -m Simulator.experiments.qwen2_5_7b.tests.integration.value_expansion
 
 # Existing dtype controls.
 bash Simulator/experiments/qwen2_5_7b/run.sh toolchain python -B -m Simulator.experiments.qwen2_5_7b.tests.integration.matrix_kernels --dtype float32
@@ -180,7 +192,9 @@ Spike is the numeric checker. TOGSim schedules tile operations and memory traffi
 - BF16 GEMM/BMM reduction fusion is disabled until its transposed accumulator
   path is implemented. Ordinary BMM now uses the FP32 accumulator path.
 - Real-width attention/RoPE/GQA/softmax and cache updates pass the tested short
-  sequence. Complete layers and full-model inference remain unvalidated.
+  sequence. The new direct upstream decoder compiles but currently fails its
+  numerical check; see [the Transformers baseline](transformers.md). Complete
+  layer timing and full-model inference remain unvalidated.
 - The LMUL cap, software BF16 conversions, FP32 scratchpad partial sums, and
   synchronous bias load are visible code-generation choices. They can affect
   the VPU/MXU timeline; this is not proof of native TPUv3/XLA instruction timing.

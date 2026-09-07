@@ -14,6 +14,23 @@ EVENT = re.compile(r"\[(\d+)\]\[Core (\d+)\]\[(INST_ISSUED|INST_FINISHED)\s*\]\[
 COMPLETE = re.compile(r"Kernel (\d+) has completed .* operation: (\S+) finished at cycle (\d+)")
 
 
+def phase_file(result):
+    name = result.get("probe", {}).get("phase_file", "attention_phases.json")
+    if name not in ("attention_phases.json", "decoder_phases.json"):
+        raise ValueError(f"Unsupported phase metadata file: {name}")
+    return name
+
+
+def check_run_status(result, allow_numerical_mismatch=False):
+    if result["status"] == "passed":
+        return
+    if (allow_numerical_mismatch and result["status"] == "completed_with_numerical_mismatch"
+            and result.get("arguments", {}).get("allow_numerical_mismatch")
+            and result.get("probe", {}).get("numerical_status") == "failed"):
+        return
+    raise ValueError("Run did not pass; a completed exploratory run requires --allow-numerical-mismatch")
+
+
 def merge(intervals):
     result = []
     for start, end in sorted(intervals):
@@ -26,6 +43,29 @@ def merge(intervals):
 
 def overlap(intervals, start, end):
     return sum(max(0, min(end, b) - max(start, a)) for a, b in intervals)
+
+
+def activity_state_cycles(occupied, start, end):
+    """Exact simultaneous queue states; idle means all three compute queues empty."""
+    units = ("VPU", "MXU0", "MXU1")
+    labels = ["+".join(unit for bit, unit in enumerate(units) if mask & (1 << bit)) or "none"
+              for mask in range(8)]
+    events = {start: [], end: []}
+    for bit, unit in enumerate(units):
+        for a, b in merge(occupied[unit]):
+            a, b = max(start, a), min(end, b)
+            if a < b:
+                events.setdefault(a, []).append((bit, 1))
+                events.setdefault(b, []).append((bit, -1))
+    result = dict.fromkeys(labels, 0)
+    active, previous = 0, start
+    for cycle in sorted(events):
+        result[labels[active]] += cycle - previous
+        for bit, delta in events[cycle]:
+            active += delta * (1 << bit)
+        previous = cycle
+    assert active == 0 and sum(result.values()) == end - start
+    return result
 
 
 def check_matrix_nodes(run):
@@ -125,6 +165,8 @@ def main():
     parser.add_argument("--phase-last-kernels", help="Explicit phase endpoints for older runs without recorded kernel_ids")
     parser.add_argument("--window-cycles", type=int, default=5000)
     parser.add_argument("--plot", action="store_true")
+    parser.add_argument("--allow-numerical-mismatch", action="store_true",
+                        help="Analyze an explicitly completed exploratory run, preserving its failed numerical status")
     args = parser.parse_args()
     assert args.window_cycles > 0
     args.output_dir = args.output_dir.resolve()
@@ -133,7 +175,7 @@ def main():
     run_result = json.loads((args.run / "result.json").read_text())
     config = run_result["simulator_config"]
     assert config["num_cores"] == 1 and config["num_systolic_array_per_core"] == 2
-    assert run_result["status"] == "passed"
+    check_run_status(run_result, args.allow_numerical_mismatch)
     raw_log = (args.run / "console.log").read_bytes()
     log = raw_log.decode()
     assert "[Indirect Access] Failed" not in log and "[Indirect Access] Invalid" not in log
@@ -142,15 +184,20 @@ def main():
     (args.output_dir / "dependency_audit.json").write_text(json.dumps(dependency_report, indent=2) + "\n")
     assert dependency_report["status"] == "passed", "Inter-kernel dependency audit failed; see dependency_audit.json"
     jobs, occupied, kernels, total, native = analyze(log)
-    phases = json.loads((args.run / "attention_phases.json").read_text())
+    phases = json.loads((args.run / phase_file(run_result)).read_text())
     if args.phase_last_kernels:
         last_ids = list(map(int, args.phase_last_kernels.split(",")))
         assert len(last_ids) == len(phases)
     else:
         last_ids = [phase["kernel_ids"][-1] for phase in phases]
+        phase_ids = [identity for phase in phases for identity in phase["kernel_ids"]]
+        assert phase_ids == list(kernels), "Phase metadata must cover each completed kernel exactly once, in order"
     assert last_ids == sorted(last_ids) and last_ids[-1] == max(kernels)
     units = ("VPU", "MXU0", "MXU1")
     result = {"total_cycles": total, "matrix_graph_nodes_checked": matrix_nodes,
+              "run_status": run_result["status"],
+              "measurement_class": run_result.get("probe", {}).get("measurement_class", "validation-gated"),
+              "numerical_validation": run_result.get("probe", {}).get("numerical_validation", "see source run"),
               "core_freq_mhz": config["core_freq_mhz"],
               "trace_analyzer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "log_sha256": hashlib.sha256(raw_log).hexdigest(),
@@ -160,12 +207,14 @@ def main():
               "phase_boundary_semantics": "kernel retirement plus DMA-response drain; checked against every instruction event and subsequent kernel dispatch",
               "dependency_audit": "passed for all single-stream kernel boundaries and logged DMA responses",
               "queue_occupied_cycles": {u: overlap(occupied[u], 0, total) for u in units},
+              "simultaneous_queue_state_cycles": activity_state_cycles(occupied, 0, total),
               "native_active_cycles": native, "phases": []}
     start = 0
     for phase, last in zip(phases, last_ids):
         end = kernels[last]["finish_cycle"]
         result["phases"].append({"phase": phase["phase"], "start_cycle": start, "end_cycle": end,
                                   "cycles": end - start, "last_kernel_id": last,
+                                  "simultaneous_queue_state_cycles": activity_state_cycles(occupied, start, end),
                                   "queue_occupied_fraction": {u: overlap(occupied[u], start, end) / (end - start) for u in units}})
         start = end
     result["post_completion_tail_cycles"] = total - start
@@ -199,9 +248,32 @@ def main():
             axes[0].text((phase["start_cycle"] + phase["end_cycle"]) / 2, 108, phase["phase"], ha="center", fontsize=10)
         axes[-1].set_xlabel(f"Simulated core cycle — {args.window_cycles:,}-cycle averaging windows")
         shape = run_result["arguments"]
-        figure.suptitle(f"Qwen2.5-7B attention only · {shape['dtype']} · {shape['seq_len']}-token prefill + {shape['decode_steps']} decode steps\nQueue occupancy, not useful FLOPs · Dashed lines mark DMA-drained phase completion", fontsize=11)
+        scope = "one decoder layer" if shape.get("component") == "decoder" else "attention only"
+        warning = " · EXPLORATORY: CPU numerical check failed" if run_result["status"] != "passed" else ""
+        figure.suptitle(f"Qwen2.5-7B {scope} · {shape['dtype']} · {shape['seq_len']}-token prefill + {shape['decode_steps']} decode steps\nQueue occupancy, not useful FLOPs{warning}", fontsize=11)
         figure.savefig(args.output_dir / "queue_occupancy.png", dpi=160)
         plt.close(figure)
+        # Preserve a direct interval view as well as the averaged overview.
+        # These are queue-residence intervals, not physical MAC activity.
+        colors = {"VPU": "#8b5cf6", "MXU0": "#0891b2", "MXU1": "#e58b19"}
+        for phase in result["phases"]:
+            begin, end = phase["start_cycle"], phase["end_cycle"]
+            figure, axis = plt.subplots(figsize=(12, 3.5), layout="constrained")
+            for row, unit in enumerate(units):
+                intervals = [(max(a, begin), min(b, end)) for a, b in occupied[unit]
+                             if a < end and b > begin]
+                axis.broken_barh([((a - begin) / config["core_freq_mhz"],
+                                  (b - a) / config["core_freq_mhz"]) for a, b in intervals],
+                                (row - .25, .5), facecolors=colors[unit], linewidth=0)
+            axis.set_yticks(range(3), units)
+            axis.set_ylim(2.7, -.7)
+            axis.set_xlim(0, (end - begin) / config["core_freq_mhz"])
+            axis.set_xlabel(f"Microseconds from {phase['phase']} start (cycle {begin:,}); {config['core_freq_mhz']} MHz")
+            axis.grid(axis="x", alpha=.2)
+            axis.set_title(f"Qwen2.5-7B {scope} · {phase['phase']} · exact trace intervals\n"
+                           f"Colored = nonempty compute queue, not useful arithmetic{warning}", fontsize=10)
+            figure.savefig(args.output_dir / f"unit_activity_{phase['phase']}.png", dpi=180)
+            plt.close(figure)
     print(json.dumps(result, indent=2))
 
 

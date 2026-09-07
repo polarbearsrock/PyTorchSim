@@ -12,7 +12,7 @@ case "$QWEN_MODE" in
   -h|--help)
     printf 'Usage: bash Simulator/experiments/qwen2_5_7b/run.sh MODE [ARGS...]\n'
     printf 'Modes: audit, cpu, functional, timing; toolchain COMMAND [ARGS...]\n'
-    printf 'Workload options: --component attention|rmsnorm|q_proj|mlp|attention_parts\n'
+    printf 'Workload options: --component decoder|attention|rmsnorm|q_proj|mlp|attention_parts (default: decoder)\n'
     printf 'Use audit --help for all workload arguments. See the adjacent README.md.\n'
     exit 0 ;;
   audit) exec python3 -B -m Simulator.experiments.qwen2_5_7b --mode audit "$@" ;;
@@ -42,6 +42,34 @@ if [ "$QWEN_MODE" = toolchain ]; then
 fi
 QWEN_STATUS=0
 QWEN_EXTRA_ARGS=()
+if [ -n "${QWEN_GEM5_ROOT:-}" ] && [ -n "${QWEN_GEM5_BUILD_ROOT:-}" ]; then
+  printf 'Select either QWEN_GEM5_ROOT or QWEN_GEM5_BUILD_ROOT, not both\n' >&2; exit 2
+fi
+if [ -n "${QWEN_GEM5_ROOT:-}" ]; then
+  # A permanent installation need not live in TMPDIR. Only build scratch does.
+  QWEN_GEM5_ROOT=$(realpath -e -- "$QWEN_GEM5_ROOT")
+  if [ ! -x "$QWEN_GEM5_ROOT/bin/gem5.opt" ] || [ ! -f "$QWEN_GEM5_ROOT/build.json" ]; then
+    printf 'QWEN_GEM5_ROOT requires bin/gem5.opt and build.json; build gem5 first\n' >&2; exit 2
+  fi
+  python3 -B "$QWEN_EXPERIMENT/tools/gem5/record_build.py" --verify "$QWEN_GEM5_ROOT"
+  QWEN_EXTRA_ARGS+=(--bind "$QWEN_GEM5_ROOT/bin/gem5.opt:/workspace/gem5-toolchain/bin/gem5.opt:ro")
+  QWEN_EXTRA_ARGS+=(--env GEM5_PATH=/workspace/gem5-toolchain/bin/gem5.opt)
+  cp "$QWEN_GEM5_ROOT/build.json" "$QWEN_RUN/gem5-build.json"
+  if [ -f "$QWEN_GEM5_ROOT/installation.json" ]; then
+    cp "$QWEN_GEM5_ROOT/installation.json" "$QWEN_RUN/gem5-installation.json"
+  fi
+fi
+if [ -n "${QWEN_GEM5_BUILD_ROOT:-}" ]; then
+  if [ "$QWEN_MODE" != toolchain ]; then
+    printf 'QWEN_GEM5_BUILD_ROOT is only for toolchain build commands\n' >&2; exit 2
+  fi
+  QWEN_GEM5_BUILD_ROOT=$(realpath -- "$QWEN_GEM5_BUILD_ROOT")
+  case "$QWEN_GEM5_BUILD_ROOT" in
+    "$(realpath -- "$TMPDIR")"/*) ;;
+    *) printf 'QWEN_GEM5_BUILD_ROOT must be under TMPDIR\n' >&2; exit 2 ;;
+  esac
+  QWEN_EXTRA_ARGS+=(--bind "$QWEN_GEM5_BUILD_ROOT:/workspace/gem5-toolchain")
+fi
 if [ -n "${QWEN_TOGSIM_BUILD:-}" ]; then
   QWEN_TOGSIM_BUILD=$(realpath -- "$QWEN_TOGSIM_BUILD")
   case "$QWEN_TOGSIM_BUILD" in
@@ -102,7 +130,7 @@ timeout --signal=TERM --kill-after=10s "${QWEN_TIMEOUT_SECONDS:-300}s" \
   --pwd "$QWEN_REPO" "$QWEN_IMAGE" \
   "${QWEN_COMMAND[@]}" \
   > "$QWEN_RUN/console.log" 2>&1 || QWEN_STATUS=$?
-if [ "$QWEN_STATUS" -eq 0 ] && [ "$QWEN_MODE" = timing ] && [ -f "$QWEN_RUN/attention_phases.json" ]; then
+if [ "$QWEN_STATUS" -eq 0 ] && [ "$QWEN_MODE" = timing ] && { [ -f "$QWEN_RUN/attention_phases.json" ] || [ -f "$QWEN_RUN/decoder_phases.json" ]; }; then
   # Numerical success alone must not label an invalid timing schedule a pass.
   # The audit is stdlib-only and runs after the simulator's log is closed.
   python3 -B -m Simulator.experiments.qwen2_5_7b.analysis.dependency_audit "$QWEN_RUN" "$QWEN_RUN/analysis" \

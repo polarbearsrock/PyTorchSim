@@ -1,10 +1,24 @@
 # Qwen2.5-7B / single-core TPUv3 study
 
-Start here for running and extending the study. We use upstream Transformers
-model components, not a handwritten Qwen implementation. The current continuous
-timing workload is **one real-width attention module**, with synthetic BF16
-weights, eight-token prefill and two cached decode steps. A complete decoder
-layer and full-model timing are not implemented yet.
+Start here for running and extending the study. The default workload now calls
+the installed Transformers **`Qwen2DecoderLayer` directly**, with no custom model
+forward or private cache manipulation. See [the Transformers baseline](docs/transformers.md).
+Full-width CPU validation passes; the initial compiled layer fails the existing
+numerical check, so decoder timing is **not yet validated**. The prior attention
+diagnostic remains the latest validated timing workload. Full-model timing is
+not implemented yet. All current model weights are synthetic BF16.
+
+The [exploratory full-layer utilization experiment](docs/utilization.md) now
+has a complete 93-kernel prefill/decode trace with passing timing-dependency
+checks. Numerical validation still fails: decode exposed a separate value-head
+expansion error, which is now [fixed in the frontend tiler](docs/value-expansion.md).
+All nine exact expansion regressions pass. Smaller full-layer CPU tolerance
+differences remain, so this is not yet an accepted model-performance baseline.
+
+The [B=1, S=128 attempt](docs/utilization-s128.md) stalled during gem5 kernel
+latency generation and produced no utilization trace. The matrix-width bug is
+now [fixed in a fork-backed gem5 installation](docs/gem5.md); all five stalled
+kernel binaries replay successfully. Full S=8/S=128 timing reruns remain pending.
 
 ## Source map
 
@@ -13,20 +27,23 @@ qwen2_5_7b/
   run.sh                  Host/container entry point
   runner.py               CLI, dispatch and result manifests
   config.py               Model loading and backend setup
+  provenance.py           Pinned Transformers version and source integrity
   validation.py           Shared numerical checks
   submission.py           Complete phase metadata without device barriers
   configs/                Pinned model dimensions and tile mappings
-  workloads/              Upstream attention, component and CPU workloads
+  workloads/              Direct upstream decoder; attention/component diagnostics
   analysis/               Memory inventory, dependency audit and activity traces
   tests/unit/             Fast tests requiring only the Python standard library
   tests/integration/      Frontend and compiled numerical regression suites
-  tools/                  Offline TOGSim build helper and BF16 toolchain sources
+  tools/                  TOGSim, BF16 and gem5 build/install helpers
   docs/                   Walkthroughs, toolchain instructions and historical results
 ```
 
 The main model-facing files are:
 
 - [configs/model.json](configs/model.json): pinned Qwen dimensions and revision.
+- [workloads/decoder.py](workloads/decoder.py): direct `Qwen2DecoderLayer` calls,
+  upstream mask construction and public `DynamicCache` interface; no local model class.
 - [workloads/attention.py](workloads/attention.py): `CachedAttention` wraps
   Transformers `Qwen2Attention`; `run_attention` runs prefill/cached decode.
 - [workloads/components.py](workloads/components.py): isolated upstream RMSNorm,
@@ -34,10 +51,9 @@ The main model-facing files are:
 - [workloads/cpu_reference.py](workloads/cpu_reference.py): reduced two-layer CPU
   correctness reference, explicitly not a full-width performance result.
 
-The next workload should wrap upstream `Qwen2DecoderLayer`, preserving its norms,
-attention, MLP and residuals. Full architecture code is supplied by the container's
-Transformers 4.43.4 package (`transformers.models.qwen2.modeling_qwen2`), not vendored
-into this study.
+Full architecture code is supplied by the container's pinned Transformers 4.43.4
+package (`transformers.models.qwen2.modeling_qwen2`), not vendored into this study.
+The new decoder checks its installed-package source hashes before executing.
 
 ## Run
 
@@ -49,7 +65,12 @@ storage. The launcher also works by absolute path from another working directory
 bash Simulator/experiments/qwen2_5_7b/run.sh audit --context-tokens 2048
 python3 -B -m unittest discover -s Simulator/experiments/qwen2_5_7b/tests/unit -v
 
-# CPU attention reference at the same dimensions as the timing experiment.
+# New standard decoder workload: CPU first, then numerical simulator validation.
+bash Simulator/experiments/qwen2_5_7b/run.sh cpu --component decoder --seq-len 8 --decode-steps 2
+# Select the BF16 toolchain before running functional mode. Currently fails the numerical gate.
+bash Simulator/experiments/qwen2_5_7b/run.sh functional --component decoder --seq-len 8 --decode-steps 2
+
+# Historical attention-only diagnostic.
 bash Simulator/experiments/qwen2_5_7b/run.sh cpu --component attention --seq-len 8 --decode-steps 2
 
 # Select the BF16 toolchain and corrected TOGSim build first; see docs below.
@@ -57,8 +78,10 @@ bash Simulator/experiments/qwen2_5_7b/run.sh timing --component attention --seq-
 ```
 
 `--context-tokens` affects the separate memory inventory, not the timed attention
-sequence. `--seq-len` and `--decode-steps` set that workload. `cpu` without an
-attention component retains the existing reduced-model CPU-reference behavior.
+sequence. `--seq-len` and `--decode-steps` set that workload. The default component
+is now `decoder`, including in CPU mode. Legacy CPU requests for isolated
+`rmsnorm`, `q_proj`, or `mlp` still select the reduced-model CPU reference;
+use the explicit decoder or attention component for real-width layer work.
 
 The package entry point is `python -B -m Simulator.experiments.qwen2_5_7b`.
 Container-only checks and analysis use `run.sh toolchain python -B -m MODULE ...`:
@@ -82,6 +105,11 @@ kernel submission cannot be omitted; this does not add a simulated device barrie
 ## Documentation
 
 - [Attention execution and trace walkthrough](docs/attention.md)
+- [Standard Transformers baseline and current validation status](docs/transformers.md)
+- [Exploratory decoder utilization results and rerun](docs/utilization.md)
+- [B=1, S=128 attempt and kernel-latency stall evidence](docs/utilization-s128.md)
+- [gem5 matrix-width fix, permanent fork installation and regression tests](docs/gem5.md)
+- [Decode value-expansion root cause, compiler fix and exact regressions](docs/value-expansion.md)
 - [BF16 setup, compiled regression suites and known limitations](docs/toolchain.md)
 - [Experiment contract, bring-up history and prior evidence](docs/history.md)
 - [File migration guide](docs/layout.md)

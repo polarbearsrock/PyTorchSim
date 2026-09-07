@@ -460,7 +460,13 @@ class TileAdjustMixin():
         self._tile_size[vlane_split_axis] = math.ceil(self._tile_size[vlane_split_axis] / padded_size) * padded_size
 
     def apply_constraints(self, constraints, ranges):
-        for idx, (axis_constraints, axis_size) in enumerate(zip(constraints.values(), ranges)):
+        # Constraints are keyed by loop symbol; their insertion order follows
+        # the input address expression, not the loop axes. For example,
+        # index1 + stride * FloorDiv(index0, 7) visits index1 first. A positional
+        # zip would constrain index1 to 7 and leave index0 unconstrained.
+        axes = {f"index{idx}": idx for idx in range(len(ranges))}
+        for axis, axis_constraints in constraints.items():
+            idx = axes[str(axis)]
             for const in axis_constraints:
                 if const.args[1] == 1:
                     continue
