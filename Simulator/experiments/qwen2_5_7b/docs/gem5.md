@@ -133,8 +133,11 @@ editing the checkout alone does not update the executable.
 
 ## Remaining experiment work
 
-The stall is fixed and tested. The full B=1, S=128 prefill/decode utilization
-experiment has **not** been rerun with this gem5 yet. Regenerate the S=8 timing
+The stall is fixed and tested. The 2026-09-07 B=1, S=128 run was subsequently
+invalidated by a separate [LLVM timing-region bug](tog.md). The
+[2026-09-08 corrected rerun](utilization-s128.md) now completes with both fixes
+and passing attribution, dependency, and trace-counter checks. Full-layer CPU
+numerical tolerance differences remain unresolved. Regenerate the S=8 timing
 baseline too: completion with the old eight-element assumption did not prove
 that its short/tail vector timing was correct. Preserve the old results as
 historical evidence; use fresh latency caches for the corrected simulator.

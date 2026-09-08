@@ -82,6 +82,13 @@ export QWEN_GEM5_ROOT=/data2/s2chitni/psal-postech/gem5
 The original image's gem5 undercounts wide BF16 matrix feeds and can stall.
 The gem5 selection is independent of the Spike/compiler selections below.
 
+BF16 timing additionally requires the [corrected source-built LLVM compiler](tog.md).
+The bundled LLVM pass incorrectly assumes equal matrix push/read counts for
+mixed-width BF16-input/FP32-output transfers. New BF16 timing compilation fails
+explicitly if the selected compiler lacks the built-in fix. This workspace's
+local toolchain configuration now selects the permanent LLVM installation by
+default; there is no `TORCHSIM_TOG_PLUGIN` requirement.
+
 From the repository root:
 
 ```bash

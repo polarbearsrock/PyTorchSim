@@ -3,10 +3,11 @@ import sys
 import importlib
 import yaml
 import logging
+from PyTorchSimFrontend.toolchain import llvm_binary_directory
 
 CONFIG_TORCHSIM_DIR = os.environ.get('TORCHSIM_DIR', default='/workspace/PyTorchSim')
 CONFIG_GEM5_PATH = os.environ.get('GEM5_PATH', default="/workspace/gem5/build/RISCV/gem5.opt")
-CONFIG_TORCHSIM_LLVM_PATH = os.environ.get('TORCHSIM_LLVM_PATH', default="/usr/bin")
+CONFIG_TORCHSIM_LLVM_PATH = llvm_binary_directory(CONFIG_TORCHSIM_DIR)
 
 CONFIG_TORCHSIM_TOG_HOST_CC = os.environ.get("TORCHSIM_TOG_HOST_CC", "gcc")
 

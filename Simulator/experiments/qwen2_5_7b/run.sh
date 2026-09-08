@@ -42,6 +42,15 @@ if [ "$QWEN_MODE" = toolchain ]; then
 fi
 QWEN_STATUS=0
 QWEN_EXTRA_ARGS=()
+QWEN_LLVM_INSTALL=$(python3 -B -c 'from PyTorchSimFrontend.toolchain import selected_llvm_install; print(selected_llvm_install(".") or "")')
+if [ -n "$QWEN_LLVM_INSTALL" ]; then
+  QWEN_LLVM_INSTALL=$(realpath -e -- "$QWEN_LLVM_INSTALL")
+  python3 -B scripts/toolchains/llvm/record_build.py verify "$QWEN_LLVM_INSTALL"
+  QWEN_EXTRA_ARGS+=(--bind "$QWEN_LLVM_INSTALL:$QWEN_LLVM_INSTALL:ro")
+  QWEN_EXTRA_ARGS+=(--env "TORCHSIM_LLVM_ROOT=$QWEN_LLVM_INSTALL")
+  QWEN_EXTRA_ARGS+=(--env "TORCHSIM_LLVM_PATH=$QWEN_LLVM_INSTALL/bin")
+  cp "$QWEN_LLVM_INSTALL/share/pytorchsim/llvm-build.json" "$QWEN_RUN/llvm-build.json"
+fi
 if [ -n "${QWEN_GEM5_ROOT:-}" ] && [ -n "${QWEN_GEM5_BUILD_ROOT:-}" ]; then
   printf 'Select either QWEN_GEM5_ROOT or QWEN_GEM5_BUILD_ROOT, not both\n' >&2; exit 2
 fi

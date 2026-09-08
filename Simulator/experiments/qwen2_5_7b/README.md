@@ -15,10 +15,14 @@ expansion error, which is now [fixed in the frontend tiler](docs/value-expansion
 All nine exact expansion regressions pass. Smaller full-layer CPU tolerance
 differences remain, so this is not yet an accepted model-performance baseline.
 
-The [B=1, S=128 attempt](docs/utilization-s128.md) stalled during gem5 kernel
-latency generation and produced no utilization trace. The matrix-width bug is
-now [fixed in a fork-backed gem5 installation](docs/gem5.md); all five stalled
-kernel binaries replay successfully. Full S=8/S=128 timing reruns remain pending.
+The [corrected B=1, S=128 rerun](docs/utilization-s128.md) completes with the
+[fixed fork-backed gem5 installation](docs/gem5.md) and the permanent LLVM
+[native TOG fix](docs/tog.md). All 64 timing sources and 93 kernel invocations
+pass the attribution audit; prefill VPU queue occupancy is now 23.26%, not the
+invalidated 74.11%. Dependency and counter checks pass too. The older trace is
+preserved as historical evidence. Full-layer CPU tolerance differences remain
+unresolved, so these corrected timing-accounting results are still exploratory;
+a fresh S=8 rerun with this compiler remains pending.
 
 ## Source map
 
@@ -107,8 +111,9 @@ kernel submission cannot be omitted; this does not add a simulated device barrie
 - [Attention execution and trace walkthrough](docs/attention.md)
 - [Standard Transformers baseline and current validation status](docs/transformers.md)
 - [Exploratory decoder utilization results and rerun](docs/utilization.md)
-- [B=1, S=128 attempt and kernel-latency stall evidence](docs/utilization-s128.md)
+- [B=1, S=128 utilization graphs and historical stall evidence](docs/utilization-s128.md)
 - [gem5 matrix-width fix, permanent fork installation and regression tests](docs/gem5.md)
+- [LLVM mixed-width timing-region fix and compiler regression tests](docs/tog.md)
 - [Decode value-expansion root cause, compiler fix and exact regressions](docs/value-expansion.md)
 - [BF16 setup, compiled regression suites and known limitations](docs/toolchain.md)
 - [Experiment contract, bring-up history and prior evidence](docs/history.md)

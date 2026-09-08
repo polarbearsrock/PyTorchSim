@@ -1,4 +1,5 @@
 __pycache__/
+configs/toolchains.local.json
 TOGSim/build/
 .vscode
 *.ipynb_checkpoints

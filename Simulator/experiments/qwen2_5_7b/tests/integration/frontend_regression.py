@@ -105,7 +105,7 @@ class FrontendTests(unittest.TestCase):
         with patch.dict(os.environ, {"TORCHSIM_BF16_PLUGIN": "/scratch/plugin.so"}):
             for builder, args, count in (
                 (mlir_compile_command, ("kernel", 128), 7),
-                (mlir_gem5_compile_command, ("kernel", "sample", "tog", 128), 6),
+                (mlir_gem5_compile_command, ("kernel", "sample", "tog", 128), 8),
             ):
                 commands = builder(*args, uses_bf16=True)
                 self.assertEqual(len(commands), count)
@@ -113,14 +113,36 @@ class FrontendTests(unittest.TestCase):
                 self.assertNotIn("-arith-expand", commands[0])
                 self.assertIn("--pass-pipeline=builtin.module(pytorchsim-bf16", commands[1])
                 self.assertIn("--load-dialect-plugin=", commands[2])
-                self.assertIn("-arith-expand", commands[2])
-                self.assertLess(commands[2].index("-test-memref-to-gemmini"), commands[2].index("-arith-expand"))
-                self.assertIn("pytorchsim-bf16-memory,instcombine", commands[4])
-                self.assertIn(".bf16_memory.ll", commands[5])
+                lower_index = 4 if builder is mlir_gem5_compile_command else 2
+                self.assertIn("-arith-expand", commands[lower_index])
+                self.assertLess(commands[lower_index].index("-test-memref-to-gemmini"), commands[lower_index].index("-arith-expand"))
+                self.assertIn("pytorchsim-bf16-memory,instcombine", commands[lower_index + 2])
+                self.assertIn(".bf16_memory.ll", commands[lower_index + 3])
                 first, plugin, last = map(shlex.split, commands[:3])
                 self.assertEqual(first[first.index("-o") + 1], plugin[plugin.index("-o") - 1])
                 self.assertEqual(plugin[plugin.index("-o") + 1], last[last.index("-o") - 1])
                 self.assertNotIn("plugin.so", " ".join(builder(*args)))
+
+    def test_corrected_builtin_tog_selection_and_old_compiler_guard(self):
+        args = ("kernel with space", "sample with space", "tog", 128)
+        with patch("PyTorchSimFrontend.extension_codecache.extension_config.CONFIG_TORCHSIM_LLVM_PATH", "/riscv-llvm/bin"):
+            with self.assertRaisesRegex(RuntimeError, "built-in mixed-width TOG fix"):
+                mlir_gem5_compile_command(*args, uses_bf16=True)
+            legacy = mlir_gem5_compile_command(*args)
+            self.assertEqual(len(legacy), 3)
+            self.assertIn("-test-tile-operation-graph=", " ".join(legacy))
+            self.assertNotIn(".tog_pre.mlir", " ".join(legacy))
+            mlir_compile_command("kernel", 128, uses_bf16=True)
+        with patch.dict(os.environ, {"TORCHSIM_BF16_PLUGIN": "/scratch/bf16 plugin.so"}):
+            commands = list(map(shlex.split, mlir_gem5_compile_command(*args, uses_bf16=True)))
+            self.assertEqual(len(commands), 8)
+            self.assertIn("-test-pytorchsim-to-vcix", " ".join(commands[2]))
+            self.assertIn("-test-tile-operation-graph=", " ".join(commands[3]))
+            self.assertFalse(any(token.startswith("--load-pass-plugin=") for token in commands[3]))
+            self.assertNotIn("pytorchsim-tile-operation-graph{", " ".join(map(shlex.join, commands)))
+            for first, second in zip(commands[:4], commands[1:5]):
+                self.assertEqual(first[first.index("-o") + 1], second[second.index("-o") - 1])
+            self.assertNotIn("-test-tile-operation-graph=", " ".join(mlir_compile_command("kernel", 128, uses_bf16=True)))
 
     def test_bf16_bitwise_operators_are_rejected(self):
         for operation in ("bitwise_and", "bitwise_or", "bitwise_xor"):

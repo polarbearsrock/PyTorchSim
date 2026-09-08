@@ -108,6 +108,8 @@ def main():
             if args.mode in ("functional", "timing"):
                 from PyTorchSimFrontend import extension_config
                 selected["gem5"] = extension_config.CONFIG_GEM5_PATH
+                for name in ("mlir-opt", "mlir-translate", "llc", "opt"):
+                    selected[name] = str(Path(extension_config.CONFIG_TORCHSIM_LLVM_PATH) / name)
             if selected["mlir_bf16_plugin"]:
                 selected["llvm_bf16_memory_plugin"] = str(Path(selected["mlir_bf16_plugin"]).with_name("libPyTorchSimBF16Memory.so"))
             for name, location in selected.items():

@@ -5,6 +5,7 @@ import subprocess
 import torch
 
 from PyTorchSimFrontend import extension_config
+from PyTorchSimFrontend.toolchain import require_mixed_width_tog, supports_mixed_width_tog
 from torch._inductor.codecache import get_hash, write
 from torch._inductor.async_compile import AsyncCompile
 from AsmParser.tog_generator import tog_generator
@@ -120,6 +121,31 @@ def add_bf16_memory_stage(commands, enabled):
     return result
 
 
+def split_tog_stage(commands):
+    """Preserve graph/marker IR for audit using the normal built-in LLVM pass."""
+    result = []
+    for command in commands:
+        tokens = shlex.split(command)
+        positions = [i for i, token in enumerate(tokens)
+                     if token.startswith("-test-tile-operation-graph=")]
+        if not positions:
+            result.append(command)
+            continue
+        index = positions[0]
+        output_index = tokens.index("-o")
+        source, output = tokens[output_index - 1], tokens[output_index + 1]
+        before, after = output + ".tog_pre.mlir", output + ".tog_post.mlir"
+        dialects = [token for token in tokens[:index]
+                    if token.startswith("--load-dialect-plugin=")]
+        preparation = tokens[:index] + ["--mlir-print-op-generic", source, "-o", before]
+        extraction = [tokens[0], *dialects, tokens[index],
+                      "--mlir-print-op-generic", before, "-o", after]
+        lowering = [tokens[0], *dialects, *tokens[index + 1:]]
+        lowering[lowering.index("-o") - 1] = after
+        result.extend(shlex.join(stage) for stage in (preparation, extraction, lowering))
+    return result
+
+
 def mlir_compile_command(filename, vectorlane_size, vlen=256, uses_bf16=False):
     commands = [re.sub(r"[ \n]+", " ",
         f"""
@@ -177,6 +203,8 @@ def mlir_compile_command(filename, vectorlane_size, vlen=256, uses_bf16=False):
     return add_bf16_memory_stage(split_bf16_plugin_stage(commands), uses_bf16)
 
 def mlir_gem5_compile_command(filename, sample_filename, tog_file, vectorlane_size, vlen=256, uses_bf16=False):
+    if uses_bf16:
+        require_mixed_width_tog(extension_config.CONFIG_TORCHSIM_LLVM_PATH)
     commands = [re.sub(r"[ \n]+", " ",
         f"""
             {extension_config.CONFIG_TORCHSIM_LLVM_PATH}/mlir-opt \
@@ -222,7 +250,12 @@ def mlir_gem5_compile_command(filename, sample_filename, tog_file, vectorlane_si
                 -O2 {sample_filename}.ll -o {sample_filename}.o
         """,
     ).strip()]
-    return add_bf16_memory_stage(split_bf16_plugin_stage(commands), uses_bf16)
+    commands = split_bf16_plugin_stage(commands)
+    # The fixed compiler also registers VCIX for parsing saved IR. Preserve the
+    # original single-process non-BF16 pipeline with older compiler releases.
+    if uses_bf16 or supports_mixed_width_tog(extension_config.CONFIG_TORCHSIM_LLVM_PATH):
+        commands = split_tog_stage(commands)
+    return add_bf16_memory_stage(commands, uses_bf16)
 
 class SpadOverflowError(Exception):
     def __init__(self, message="SPAD overflow occurred."):
@@ -267,8 +300,6 @@ class MLIRCodeCache:
                     "patched Spike for functional execution. See "
                     "Simulator/experiments/qwen2_5_7b/docs/toolchain.md."
                 )
-        gem5_cmds = mlir_gem5_compile_command(new_input_path, sample_mlir_path, raw_tog_path, vectorlane_size, vlen=vlen, uses_bf16=uses_bf16)
-
         from filelock import FileLock
         os.makedirs(write_path, exist_ok=True)
         lock = FileLock(get_lock_path(write_path), timeout=LOCK_TIMEOUT)
@@ -305,6 +336,12 @@ class MLIRCodeCache:
                         f"but only {extension_config.CONFIG_SPAD_INFO['spad_size']} bytes available."
                     )
                     raise SpadOverflowError()
+
+        # Functional execution does not consume a timing graph. In particular it
+        # must not require a timing-only plugin or compile a throwaway sample.
+        if not extension_config.pytorchsim_timing_mode:
+            return key
+        gem5_cmds = mlir_gem5_compile_command(new_input_path, sample_mlir_path, raw_tog_path, vectorlane_size, vlen=vlen, uses_bf16=uses_bf16)
 
         # Skip if TOG file already exists
         if os.path.isfile(tog_path):
